@@ -6,6 +6,7 @@ proxy hijacking, rogue certificate authorities, and managed policy abuse.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import plistlib
@@ -67,6 +68,11 @@ DANGEROUS_PERMISSIONS: set[str] = {
     "privacy",
     "enterprise.platformKeys",
 }
+
+SUSPICIOUS_PROXY_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"charles|burp|mitm|intercept|zscaler|netskope|websense", re.IGNORECASE),
+    re.compile(r"^localhost$", re.IGNORECASE),
+)
 
 HOME = os.path.expanduser("~")
 
@@ -281,16 +287,21 @@ def _scan_chromium_preferences(
     # Check proxy settings
     proxy = prefs.get("proxy", {})
     if isinstance(proxy, dict) and proxy.get("mode") not in (None, "system", "direct", "auto_detect"):
+        proxy_host = str(proxy.get("server") or proxy.get("pac_url") or "")
+        suspicious = any(pattern.search(proxy_host) for pattern in SUSPICIOUS_PROXY_HOST_PATTERNS)
+        suspicious = suspicious or proxy.get("mode") not in ("fixed_servers", "pac_script")
+        if not suspicious:
+            return
         counter[0] += 1
         fid = f"browser_{counter[0]:03d}"
         findings.append(_make_finding(
             fid=fid,
-            severity="high",
+            severity="medium",
             category="network",
             title=f"{browser}: suspicious proxy configuration in Preferences",
             description=(
                 f"{browser} has a non-standard proxy mode configured: '{proxy.get('mode')}'. "
-                "This may redirect all browser traffic through a malicious proxy."
+                "This may route traffic through an interception or debugging proxy."
             ),
             evidence={
                 "browser": browser,
@@ -305,20 +316,20 @@ def _scan_chromium_preferences(
 
     # Check for managed/forced policies
     managed_path = os.path.join(profile_dir, "Managed Preferences")
-    policies_path = "/Library/Managed Preferences"
+    policies_path = os.path.join("/Library/Managed Preferences", browser)
     for pol_path in [managed_path, policies_path]:
         if os.path.isdir(pol_path):
             counter[0] += 1
             fid = f"browser_{counter[0]:03d}"
             findings.append(_make_finding(
                 fid=fid,
-                severity="high",
+                severity="info",
                 category="surveillance",
                 title=f"{browser}: managed enterprise policies detected",
                 description=(
                     f"Managed policy directory found at '{pol_path}'. "
                     "Enterprise policies can force install extensions, disable security features, "
-                    "or redirect traffic without user consent."
+                    "or redirect traffic. This is common on managed Macs and should be reviewed in context."
                 ),
                 evidence={"browser": browser, "policy_path": pol_path},
                 remediation=(
@@ -412,64 +423,47 @@ def _scan_firefox_extensions(
 
 
 def _scan_certificate_authorities(findings: list, counter: list):
-    """Check for custom certificate authorities in the system keychain."""
-    stdout, _, rc = _run(
-        ["security", "find-certificate", "-a", "-p"],
-        timeout=20,
-    )
-    if rc != 0 or not stdout:
-        return
+    """Check for custom trust overrides rather than flagging legitimate CAs."""
+    suspicious_domains: list[dict[str, str]] = []
+    for domain in ("user", "admin"):
+        stdout, _, rc = _run(["security", "dump-trust-settings", "-d", domain], timeout=20)
+        if rc != 0 or not stdout:
+            continue
+        if "No Trust Settings were found" in stdout:
+            continue
+        current_cert = ""
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            cert_match = re.match(r'Cert\s+\d+:\s+(.+)', stripped)
+            if cert_match:
+                current_cert = cert_match.group(1)
+                continue
+            lowered = stripped.lower()
+            if "policy oid" in lowered or "result:" in lowered:
+                suspicious_domains.append({
+                    "domain": domain,
+                    "certificate": current_cert or "unknown",
+                    "setting": stripped,
+                })
 
-    # Count non-Apple CAs
-    certs = stdout.split("-----BEGIN CERTIFICATE-----")
-    # Look for certificates without Apple in the issuer
-    # We use openssl to parse if available, otherwise just count
-    stdout2, _, rc2 = _run(
-        ["security", "find-certificate", "-a"],
-        timeout=20,
-    )
-    if rc2 != 0:
-        return
-
-    # Parse certificate names
-    cert_names: list[str] = []
-    for line in stdout2.splitlines():
-        if '"labl"' in line or '"subj"' in line:
-            m = re.search(r'"([^"]+)"$', line)
-            if m:
-                cert_names.append(m.group(1))
-
-    # Flag certificates from non-Apple issuers
-    suspicious_certs = [
-        name for name in cert_names
-        if not any(trusted in name for trusted in [
-            "Apple", "DigiCert", "Comodo", "Sectigo", "Let's Encrypt",
-            "GlobalSign", "GeoTrust", "VeriSign", "Entrust", "Symantec",
-            "GoDaddy", "IdenTrust", "QuoVadis", "ISRG",
-        ])
-    ]
-
-    if suspicious_certs:
+    if suspicious_domains:
         counter[0] += 1
         fid = f"browser_{counter[0]:03d}"
         findings.append(_make_finding(
             fid=fid,
-            severity="critical",
-            category="spyware",
-            title=f"Suspicious root certificate(s) in system keychain ({len(suspicious_certs)} found)",
+            severity="medium",
+            category="network",
+            title=f"Custom certificate trust overrides detected ({len(suspicious_domains)} entries)",
             description=(
-                f"Found {len(suspicious_certs)} certificate(s) in the system keychain from "
-                "unknown or untrusted issuers. Rogue root CAs can enable man-in-the-middle "
-                "attacks on all HTTPS connections."
+                "Custom user or admin trust settings are configured. These can be legitimate, "
+                "but they are also a common way to force trust for interception certificates."
             ),
             evidence={
-                "suspicious_cert_names": suspicious_certs[:20],
-                "total_certs": len(cert_names),
+                "trust_overrides": suspicious_domains[:20],
             },
             remediation=(
-                "Open Keychain Access and review certificates under System Roots. "
-                "Remove any certificates you do not recognise. "
-                "Run: `security find-certificate -a | grep 'labl'` for the full list."
+                "Review custom trust settings with `security dump-trust-settings -d user` and "
+                "`security dump-trust-settings -d admin`. Remove unexpected trust overrides in Keychain Access."
             ),
         ))
 
@@ -556,25 +550,25 @@ def _scan_browser_proxy_settings(findings: list, counter: list):
 
     # Flag if HTTP/HTTPS proxy is set to a non-local address
     for proxy_type in ["HTTPProxy", "HTTPSProxy", "SOCKSProxy"]:
-        if proxy_type in proxy_info:
+        enable_key = proxy_type.replace("Proxy", "Enable")
+        if proxy_type in proxy_info and proxy_info.get(enable_key) == "1":
             proxy_host = proxy_info[proxy_type]
             port_key = proxy_type.replace("Proxy", "Port")
             proxy_port = proxy_info.get(port_key, "?")
             try:
-                import ipaddress
                 addr = ipaddress.ip_address(proxy_host)
                 if not addr.is_private and not addr.is_loopback:
                     counter[0] += 1
                     fid = f"browser_{counter[0]:03d}"
                     findings.append(_make_finding(
                         fid=fid,
-                        severity="critical",
+                        severity="low",
                         category="network",
                         title=f"System {proxy_type} set to external host: {proxy_host}:{proxy_port}",
                         description=(
                             f"System-wide {proxy_type} is configured to route all traffic "
                             f"through {proxy_host}:{proxy_port}, an external address. "
-                            "This could intercept all unencrypted traffic."
+                            "This is often legitimate on corporate or filtered networks, but it should be verified."
                         ),
                         evidence={
                             "proxy_type": proxy_type,
@@ -588,27 +582,27 @@ def _scan_browser_proxy_settings(findings: list, counter: list):
                         ),
                     ))
             except ValueError:
-                # Hostname rather than IP — still flag
-                counter[0] += 1
-                fid = f"browser_{counter[0]:03d}"
-                findings.append(_make_finding(
-                    fid=fid,
-                    severity="high",
-                    category="network",
-                    title=f"System {proxy_type} configured: {proxy_host}:{proxy_port}",
-                    description=(
-                        f"System-wide {proxy_type} is set to {proxy_host}:{proxy_port}. "
-                        "Verify this proxy is intentionally configured."
-                    ),
-                    evidence={
-                        "proxy_type": proxy_type,
-                        "proxy_host": proxy_host,
-                        "proxy_port": proxy_port,
-                    },
-                    remediation=(
-                        "Remove proxy settings in System Settings > Network > <Interface> > Proxies."
-                    ),
-                ))
+                if any(pattern.search(proxy_host) for pattern in SUSPICIOUS_PROXY_HOST_PATTERNS):
+                    counter[0] += 1
+                    fid = f"browser_{counter[0]:03d}"
+                    findings.append(_make_finding(
+                        fid=fid,
+                        severity="medium",
+                        category="network",
+                        title=f"System {proxy_type} configured with interception-style host",
+                        description=(
+                            f"System-wide {proxy_type} is set to {proxy_host}:{proxy_port}. "
+                            "This hostname resembles a debugging or interception proxy."
+                        ),
+                        evidence={
+                            "proxy_type": proxy_type,
+                            "proxy_host": proxy_host,
+                            "proxy_port": proxy_port,
+                        },
+                        remediation=(
+                            "Remove proxy settings in System Settings > Network > <Interface> > Proxies."
+                        ),
+                    ))
 
 
 # ---------------------------------------------------------------------------

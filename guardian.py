@@ -17,6 +17,7 @@ import importlib
 import json
 import os
 import platform
+import pwd
 import subprocess
 import sys
 import time
@@ -129,12 +130,15 @@ def _check_third_party_packages() -> dict:
 
 
 def _check_libimobiledevice() -> bool:
-    """Check if ideviceinfo is on PATH."""
+    """Check if the required libimobiledevice tools are on PATH."""
     import shutil
-    if shutil.which("ideviceinfo") is not None:
+    required = ["ideviceinfo", "ideviceinstaller"]
+    missing = [tool for tool in required if shutil.which(tool) is None]
+    if not missing:
         return True
     print(_c(YELLOW, "[!] libimobiledevice not found — iOS scanning will be skipped."))
-    print(_c(YELLOW, "    Install with: brew install libimobiledevice"))
+    print(_c(YELLOW, f"    Missing tools: {', '.join(missing)}"))
+    print(_c(YELLOW, "    Install with: brew install libimobiledevice ideviceinstaller"))
     return False
 
 
@@ -227,11 +231,9 @@ def _crossref_findings(findings: list, ioc_db: dict) -> list:
             val = ev.get(proc_key, "")
             if val:
                 val_lower = os.path.basename(val.split()[0]).lower() if val.split() else ""
-                for mp in malicious_procs:
-                    if mp in val_lower:
-                        finding["severity"] = "critical"
-                        finding.setdefault("ioc_match", []).append(f"malicious_process:{mp}")
-                        break
+                if val_lower in malicious_procs:
+                    finding["severity"] = "critical"
+                    finding.setdefault("ioc_match", []).append(f"malicious_process:{val_lower}")
 
     return findings
 
@@ -247,18 +249,83 @@ def crossref_all_results(results: dict, ioc_db: dict) -> None:
 # YARA scanning
 # ---------------------------------------------------------------------------
 
-def run_yara_scan(yara_available: bool) -> list:
+_YARA_GENERIC_RULES = {
+    "OSX_Keylogger_Indicators",
+    "OSX_ScreenCapture_Indicators",
+    "Generic_Suspicious_MachO_Stripped",
+    "OSX_PrivilegeEscalation_Strings",
+    "OSX_LaunchAgent_Persistence",
+}
+
+
+def _codesign_status(path: str) -> dict[str, bool]:
+    if not os.path.exists(path):
+        return {"exists": False, "signed": False, "apple_signed": False}
+
+    _, _, rc = _run_subprocess(["codesign", "-v", "--deep", path], timeout=10)
+    out, err, _ = _run_subprocess(["codesign", "-dv", path], timeout=10)
+    combined = f"{out}\n{err}".lower()
+    return {
+        "exists": True,
+        "signed": rc == 0,
+        "apple_signed": "authority=apple" in combined or "teamidentifier=apple" in combined,
+    }
+
+
+def _run_subprocess(cmd: list[str], timeout: int = 15) -> tuple[str, str, int]:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "timeout", -1
+    except FileNotFoundError:
+        return "", f"command not found: {cmd[0]}", -1
+    except Exception as exc:
+        return "", str(exc), -1
+
+
+def _should_suppress_yara_match(path: str, rule_name: str) -> bool:
+    status = _codesign_status(path)
+    path_lower = path.lower()
+    in_system_path = path.startswith(("/System/", "/usr/", "/bin/", "/sbin/"))
+    in_app_bundle = ".app/" in path_lower or path.startswith(("/Applications/", os.path.expanduser("~/Applications/")))
+
+    if status["apple_signed"] and (in_system_path or rule_name in _YARA_GENERIC_RULES):
+        return True
+
+    if rule_name in _YARA_GENERIC_RULES and status["signed"] and in_app_bundle:
+        return True
+
+    return False
+
+
+def _iter_yara_scan_dirs() -> list[tuple[str, int]]:
+    home = os.path.expanduser("~")
+    return [
+        ("/Applications", 6),
+        (os.path.join(home, "Applications"), 6),
+        (os.path.join(home, "Library"), 8),
+        (os.path.join(home, "Library", "Application Support", "Google", "Chrome"), 10),
+        (os.path.join(home, "Library", "Application Support", "BraveSoftware"), 10),
+        (os.path.join(home, "Library", "Application Support", "Microsoft Edge"), 10),
+        (os.path.join(home, "Library", "Application Support", "Firefox"), 10),
+        ("/tmp", 4),
+        ("/var/tmp", 4),
+    ]
+
+
+def run_yara_scan(yara_available: bool) -> tuple[list, bool]:
     """
     If yara-python is available, load the rule file and scan key directories.
-    Returns a list of finding dicts (source='yara').
+    Returns `(findings, interrupted)`.
     """
     if not yara_available:
-        return []
+        return [], False
 
     rules_path = Path(__file__).parent / "ioc" / "yara_rules.yar"
     if not rules_path.exists():
         print(_c(YELLOW, f"[!] YARA rules file not found: {rules_path}"))
-        return []
+        return [], False
 
     try:
         import yara  # type: ignore
@@ -266,74 +333,101 @@ def run_yara_scan(yara_available: bool) -> list:
         rules = yara.compile(filepath=str(rules_path))
     except Exception as exc:
         print(_c(RED, f"[✗] Failed to compile YARA rules: {exc}"))
-        return []
-
-    scan_dirs = [
-        "/Applications",
-        os.path.expanduser("~/Library"),
-        "/tmp",
-        "/var/tmp",
-    ]
+        return [], False
 
     findings: list = []
     fid_counter = 0
 
-    for directory in scan_dirs:
+    for directory, max_depth in _iter_yara_scan_dirs():
         if not os.path.isdir(directory):
             continue
-        for root, dirs, files in os.walk(directory, followlinks=False):
-            # Don't recurse into deeply nested subdirs of ~/Library to keep it fast
-            depth = root[len(directory):].count(os.sep)
-            if depth > 4:
-                dirs.clear()
-                continue
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                if not os.path.isfile(fpath):
+        try:
+            for root, dirs, files in os.walk(directory, followlinks=False):
+                depth = root[len(directory):].count(os.sep)
+                if depth > max_depth:
+                    dirs.clear()
                     continue
-                # Skip very large files (> 50 MB)
-                try:
-                    if os.path.getsize(fpath) > 50 * 1024 * 1024:
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    if not os.path.isfile(fpath):
                         continue
-                except OSError:
-                    continue
-                try:
-                    matches = rules.match(fpath, timeout=10)
-                    for match in matches:
-                        fid_counter += 1
-                        findings.append({
-                            "id": f"yara_{fid_counter:03d}",
-                            "severity": "high",
-                            "category": "malware",
-                            "title": f"YARA rule match: {match.rule}",
-                            "description": (
-                                f"File '{fpath}' matched YARA rule '{match.rule}' "
-                                f"(namespace: {match.namespace})."
-                            ),
-                            "evidence": {
-                                "file": fpath,
-                                "rule": match.rule,
-                                "namespace": match.namespace,
-                                "tags": list(match.tags),
-                                "strings": [
-                                    {"offset": s.offset, "identifier": s.identifier}
-                                    for s in match.strings[:10]
-                                ],
-                            },
-                            "remediation": (
-                                f"Investigate '{fpath}'. If confirmed malicious, quarantine "
-                                "and delete. Check for related persistence mechanisms."
-                            ),
-                            "source": "yara",
-                        })
-                except yara.TimeoutError:
-                    pass
-                except yara.Error:
-                    pass
-                except Exception:
-                    pass
+                    try:
+                        if os.path.getsize(fpath) > 50 * 1024 * 1024:
+                            continue
+                    except OSError:
+                        continue
+                    try:
+                        matches = rules.match(fpath, timeout=10)
+                        for match in matches:
+                            if _should_suppress_yara_match(fpath, match.rule):
+                                continue
+                            fid_counter += 1
+                            findings.append({
+                                "id": f"yara_{fid_counter:03d}",
+                                "severity": "high",
+                                "category": "malware",
+                                "title": f"YARA rule match: {match.rule}",
+                                "description": (
+                                    f"File '{fpath}' matched YARA rule '{match.rule}' "
+                                    f"(namespace: {match.namespace})."
+                                ),
+                                "evidence": {
+                                    "file": fpath,
+                                    "rule": match.rule,
+                                    "namespace": match.namespace,
+                                    "tags": list(match.tags),
+                                    "strings": [
+                                        {"offset": s.offset, "identifier": s.identifier}
+                                        for s in match.strings[:10]
+                                    ],
+                                },
+                                "remediation": (
+                                    f"Investigate '{fpath}'. If confirmed malicious, quarantine "
+                                    "and delete. Check for related persistence mechanisms."
+                                ),
+                                "source": "yara",
+                            })
+                    except yara.TimeoutError:
+                        continue
+                    except yara.Error:
+                        continue
+                    except KeyboardInterrupt:
+                        return findings, True
+                    except Exception:
+                        continue
+        except KeyboardInterrupt:
+            return findings, True
+    return findings, False
 
-    return findings
+
+def _default_report_name() -> str:
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"guardian-report-{timestamp}.html"
+
+
+def _safe_output_dir(raw_output: str) -> Path:
+    output_dir = Path(raw_output).expanduser()
+    if not output_dir.is_absolute():
+        output_dir = (Path.cwd() / output_dir).resolve()
+    else:
+        output_dir = output_dir.resolve()
+
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        sudo_user = os.environ["SUDO_USER"]
+        sudo_home = Path(pwd.getpwnam(sudo_user).pw_dir).resolve()
+        allowed_roots = [
+            sudo_home,
+            Path("/tmp"),
+            Path("/var/tmp"),
+            Path("/private/tmp"),
+            Path("/private/var/tmp"),
+        ]
+        if not any(output_dir == root or root in output_dir.parents for root in allowed_roots):
+            raise ValueError(
+                f"--output must stay within {sudo_home} or a temporary directory when running under sudo"
+            )
+
+    return output_dir
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +693,7 @@ def main(argv=None) -> int:
         if module_name in skip_reasons:
             _print_module_skipped(module_name, skip_reasons[module_name])
 
+    interrupted = False
     try:
         # --- Phase 1: Sequential first modules ---
         seq_first = [m for m in SEQUENTIAL_FIRST if m in modules_to_run]
@@ -676,15 +771,19 @@ def main(argv=None) -> int:
                 _print_module_done(module_name, n, elapsed)
 
     except KeyboardInterrupt:
+        interrupted = True
         print()
         print(_c(YELLOW, "\n[!] Scan interrupted by user. Generating partial report..."))
 
     # --- YARA scan (after filesystem, if available) ---
-    if ctx["yara_available"] and "mac.filesystem" in modules_to_run:
+    if not interrupted and ctx["yara_available"] and "mac.filesystem" in modules_to_run:
         print(_c(YELLOW, "  [→] Running YARA scan on key directories..."), flush=True)
         t0 = time.time()
-        yara_findings = run_yara_scan(yara_available=True)
+        yara_findings, yara_interrupted = run_yara_scan(yara_available=True)
         elapsed = time.time() - t0
+        if yara_interrupted:
+            interrupted = True
+            print(_c(YELLOW, "\n[!] YARA scan interrupted by user. Continuing with partial results..."))
         # Merge into filesystem results if present, else create standalone entry
         if "mac.filesystem" in all_results:
             all_results["mac.filesystem"].setdefault("findings", []).extend(yara_findings)
@@ -710,8 +809,6 @@ def main(argv=None) -> int:
         except Exception:
             pass
 
-    macos_version = _get_macos_version()
-
     # --- Report generation ---
     report_path: str = ""
     try:
@@ -720,13 +817,13 @@ def main(argv=None) -> int:
             sys.path.insert(0, guardian_root)
         from report.generator import generate_report  # type: ignore
 
-        output_dir = Path(args.output).expanduser().resolve()
+        output_dir = _safe_output_dir(args.output)
         output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / _default_report_name()
 
         report_path = generate_report(
-            results=all_results,
-            output_dir=str(output_dir),
-            macos_version=macos_version,
+            scan_results=list(all_results.values()),
+            output_path=str(output_path),
             device_info=device_info,
         )
         print(_c(GREEN, f"\n[✓] Report saved: {report_path}"))

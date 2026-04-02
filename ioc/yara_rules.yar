@@ -351,8 +351,8 @@ rule OSX_Keylogger_Indicators
         $ax2  = "AXUIElementCreateApplication" ascii
 
     condition:
-        (2 of ($cg*)) or
-        (2 of ($hid*)) or
+        (3 of ($cg*)) or
+        (3 of ($hid*)) or
         (1 of ($cg*) and 1 of ($hid*)) or
         (1 of ($ax*) and 2 of ($cg*, $hid*))
 }
@@ -381,10 +381,10 @@ rule OSX_ScreenCapture_Indicators
         $sc3  = "SCShareableContent" ascii
 
     condition:
-        (2 of ($cg*)) or
-        (2 of ($av*)) or
+        (3 of ($cg*)) or
+        (3 of ($av*)) or
         ($rp1 and $rp2) or
-        (2 of ($sc*)) or
+        (3 of ($sc*)) or
         (1 of ($cg*) and 1 of ($av*, $rp*, $sc*))
 }
 
@@ -482,7 +482,7 @@ rule Generic_Suspicious_MachO_Stripped
 
     condition:
         ($macho64 at 0 or $macho32 at 0) and
-        (5 of ($s*))
+        (7 of ($s*))
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +541,7 @@ rule OSX_LaunchAgent_Persistence
         $la10 = "ProgramArguments" ascii
 
     condition:
-        (($la1 or $la2 or $la3) and ($la4 or $la5)) or
+        (($la1 or $la2 or $la3) and ($la4 or $la5) and 1 of ($la7, $la8, $la9, $la10)) or
         ($la6 and 2 of ($la7, $la8, $la9, $la10)) or
         (3 of ($la7, $la8, $la9, $la10) and ($la1 or $la2 or $la3))
 }
@@ -631,6 +631,6 @@ rule OSX_PrivilegeEscalation_Strings
 
     condition:
         ($macho64 at 0 or $macho32 at 0) and
-        (2 of ($s1, $s2, $s3, $s4, $s5, $s6, $s7, $s8, $s9, $s10) or
+        (3 of ($s1, $s2, $s3, $s4, $s5, $s6, $s7, $s8, $s9, $s10) or
          1 of ($s11, $s12, $s13))
 }

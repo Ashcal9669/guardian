@@ -72,6 +72,11 @@ APPLE_BUNDLE_PREFIXES: tuple[str, ...] = (
     "com.Apple.",
 )
 
+SUSPICIOUS_LABEL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"update|helper|agent|daemon|installer|login|launch", re.IGNORECASE),
+    re.compile(r"^[A-Za-z0-9._-]{18,}$"),
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -189,14 +194,20 @@ def _scan_launch_items(dirs: list[str], item_type: str, findings: list, counter:
                 continue  # skip known Apple items
 
             exes = _extract_executables_from_plist(pdata)
+            if not exes:
+                exes = [""]
             for exe in exes:
-                severity = "low"
+                severity = "medium"
                 reasons = []
+                label = str(pdata.get("Label", fname))
 
                 # Check for suspicious paths
                 if _is_suspicious_path(exe):
                     severity = "critical"
                     reasons.append(f"executable in suspicious directory: {exe}")
+
+                if not exe or not os.path.isabs(exe):
+                    reasons.append("missing or non-absolute executable path in plist")
 
                 # Check code signature
                 if os.path.exists(exe) and not _codesign_valid(exe):
@@ -204,14 +215,17 @@ def _scan_launch_items(dirs: list[str], item_type: str, findings: list, counter:
                         severity = "high"
                     reasons.append(f"invalid/missing code signature on: {exe}")
 
-                # Flag non-Apple items regardless
+                if any(pattern.search(label) for pattern in SUSPICIOUS_LABEL_PATTERNS):
+                    reasons.append(f"suspicious label: {label}")
+
+                if pdata.get("RunAtLoad") and pdata.get("KeepAlive"):
+                    reasons.append("launches at load and requests keepalive")
+
                 if not reasons:
-                    reasons.append("third-party launch item (review recommended)")
-                    severity = "info"
+                    continue
 
                 counter[0] += 1
                 fid = f"persist_{counter[0]:03d}"
-                label = pdata.get("Label", fname)
                 findings.append(_make_finding(
                     fid=fid,
                     severity=severity,
@@ -464,8 +478,12 @@ def _scan_kexts(findings: list, counter: list):
                     },
                     remediation=(
                         f"Verify the kext is from a trusted vendor. "
-                        f"Use `kextstat | grep -v com.apple` to list loaded third-party kexts. "
-                        "Remove if unknown."
+                        + (
+                            "Use `kmutil showloaded --list-only` to list loaded extensions. "
+                            if os.uname().machine == "arm64"
+                            else "Use `kextstat | grep -v com.apple` to list loaded third-party kexts. "
+                        )
+                        + "Remove if unknown."
                     ),
                 ))
 
@@ -539,7 +557,14 @@ def _scan_login_items(findings: list, counter: list):
     script = (
         'tell application "System Events" to get the name of every login item'
     )
-    stdout, stderr, rc = _run(["osascript", "-e", script], timeout=15)
+    cmd = ["osascript", "-e", script]
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user:
+        uid_out, _, uid_rc = _run(["id", "-u", sudo_user], timeout=5)
+        if uid_rc == 0 and uid_out.strip().isdigit():
+            cmd = ["launchctl", "asuser", uid_out.strip(), "osascript", "-e", script]
+
+    stdout, stderr, rc = _run(cmd, timeout=15)
     if rc != 0 or not stdout.strip():
         return
 
@@ -597,9 +622,6 @@ def scan() -> dict:
 
         # SSH authorized_keys
         _scan_ssh_authorized_keys(findings, counter)
-
-        # Kernel extensions
-        _scan_kexts(findings, counter)
 
         # Login hooks
         _scan_login_hooks(findings, counter)

@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 
@@ -84,6 +85,37 @@ KEYLOGGER_PATTERNS: list[str] = [
     "screengrab",
     "screenshot_tool",
 ]
+
+KNOWN_BENIGN_DOTFILE_PREFIXES: tuple[str, ...] = (
+    ".git",
+    ".vscode",
+    ".idea",
+    ".cache",
+    ".gradle",
+    ".m2",
+    ".terraform",
+    ".venv",
+    ".virtualenv",
+    ".ipynb",
+    ".jupyter",
+    ".conda",
+    ".python",
+    ".ansible",
+    ".sdkman",
+    ".swiftpm",
+    ".codex",
+    ".claude",
+    ".oh-my-zsh",
+    ".zcompdump",
+    ".npm",
+    ".yarn",
+    ".pnpm",
+)
+
+SUSPICIOUS_DOTFILE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"keylog|steal|rat|backdoor|launchagent|payload|implant", re.IGNORECASE),
+    re.compile(r"^[.][A-Za-z0-9_-]{18,}$"),
+)
 
 # System binary directories to check for recent modifications
 SYSTEM_BIN_DIRS: list[str] = [
@@ -269,11 +301,17 @@ def _scan_hidden_dotfiles(findings: list, counter: list) -> int:
             continue
         if entry in known_dotfiles:
             continue
+        if entry.startswith(KNOWN_BENIGN_DOTFILE_PREFIXES):
+            continue
         full_path = os.path.join(home, entry)
-        count += 1
-        # Flag executable hidden files specially
+        path_obj = Path(full_path)
         is_executable = os.access(full_path, os.X_OK) and os.path.isfile(full_path)
-        severity = "high" if is_executable else "low"
+        is_symlink = path_obj.is_symlink()
+        looks_suspicious = any(pattern.search(entry) for pattern in SUSPICIOUS_DOTFILE_PATTERNS)
+        if not (is_executable or is_symlink or looks_suspicious):
+            continue
+        count += 1
+        severity = "high" if is_executable else ("medium" if looks_suspicious else "low")
         counter[0] += 1
         fid = f"fs_{counter[0]:03d}"
         findings.append(_make_finding(
@@ -289,6 +327,8 @@ def _scan_hidden_dotfiles(findings: list, counter: list) -> int:
                 "path": full_path,
                 "is_executable": is_executable,
                 "is_directory": os.path.isdir(full_path),
+                "is_symlink": is_symlink,
+                "matched_suspicious_pattern": looks_suspicious,
             },
             remediation=(
                 f"Investigate '{full_path}'. If unknown, remove it. "
@@ -736,14 +776,3 @@ def scan() -> dict:
             "metadata": metadata,
             "error": str(exc),
         }
-
-
-def _walk_limited(root: str, max_depth: int):
-    """os.walk with a depth limit."""
-    root = root.rstrip(os.sep)
-    root_depth = root.count(os.sep)
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        depth = dirpath.count(os.sep) - root_depth
-        if depth >= max_depth:
-            dirnames.clear()
-        yield dirpath, dirnames, filenames

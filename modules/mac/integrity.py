@@ -10,6 +10,7 @@ import os
 import platform
 import plistlib
 import re
+import sqlite3
 import subprocess
 import time
 from typing import Any
@@ -267,19 +268,21 @@ def _check_system_version(findings: list, counter: list) -> dict:
 
 def _check_unsigned_kexts(findings: list, counter: list) -> int:
     """Check for loaded kernel extensions that are not Apple-signed."""
-    stdout, _, rc = _run(["kextstat"], timeout=15)
+    if _is_apple_silicon():
+        stdout, _, rc = _run(["kmutil", "showloaded", "--list-only"], timeout=20)
+    else:
+        stdout, _, rc = _run(["kextstat"], timeout=15)
     if rc != 0 or not stdout:
         return 0
 
     count = 0
-    for line in stdout.splitlines()[1:]:  # skip header
-        # Skip obvious Apple kexts
-        if "com.apple" in line:
+    for line in stdout.splitlines():
+        if not line.strip() or line.lower().startswith(("index", "no variant", "bundle identifier")):
             continue
-        parts = line.split()
-        if len(parts) < 6:
+        if "com.apple" in line.lower():
             continue
-        bundle_id = parts[-1].strip("()")
+        bundle_match = re.search(r"(com\.[A-Za-z0-9._-]+)", line)
+        bundle_id = bundle_match.group(1) if bundle_match else line.split()[-1].strip("()")
         count += 1
         counter[0] += 1
         fid = f"integ_{counter[0]:03d}"
@@ -302,54 +305,122 @@ def _check_unsigned_kexts(findings: list, counter: list) -> int:
 
 
 def _check_rosetta_intel_processes(findings: list, counter: list) -> bool:
-    """On Apple Silicon, flag if unexpected x86_64 processes are running under Rosetta."""
+    """Record whether Rosetta is installed on Apple Silicon without flagging it as suspicious."""
     if not _is_apple_silicon():
         return False
 
-    # Use ps to find processes with arch x86_64 (Rosetta)
-    stdout, _, rc = _run(["ps", "aux"], timeout=15)
-    if rc != 0 or not stdout:
+    stdout, _, rc = _run(["pkgutil", "--pkg-info", "com.apple.pkg.RosettaUpdateAuto"], timeout=10)
+    if rc != 0:
         return False
-
-    # Use arch command to check specific processes
-    # Instead, look for processes in Rosetta using `arch -x86_64`
-    stdout2, _, _ = _run(
-        ["sysctl", "-n", "kern.proc.all"],
-        timeout=10,
-    )
-
-    # Check for x86 processes using `ps -A -o pid,comm` and cross-reference with arch
-    stdout3, _, _ = _run(
-        ["bash", "-c",
-         "ps -A -o pid= | xargs -I{} sh -c 'file /proc/{}/exe 2>/dev/null | grep -q x86 && echo {}' 2>/dev/null | head -20"],
-        timeout=15,
-    )
-    # On macOS, /proc doesn't exist — use a different approach
-    # Check Activity Monitor data via sysctl
-    stdout4, _, _ = _run(
-        ["sysctl", "hw.optional.x86_64"],
-        timeout=5,
-    )
-
-    # Flag that Rosetta is present (informational scan)
-    counter[0] += 1
-    fid = f"integ_{counter[0]:03d}"
-    findings.append(_make_finding(
-        fid=fid,
-        severity="info",
-        category="integrity",
-        title="Rosetta 2 (x86 translation) capability is present",
-        description=(
-            "This Apple Silicon Mac has Rosetta 2 installed, which allows x86_64 apps to run. "
-            "While normal, x86 processes under Rosetta have slightly reduced security properties."
-        ),
-        evidence={"arch": platform.machine(), "rosetta_available": True},
-        remediation=(
-            "Review x86_64 processes in Activity Monitor (Architecture column). "
-            "Prefer native ARM64 versions of applications where available."
-        ),
-    ))
     return True
+
+
+def _check_system_extensions(findings: list, counter: list) -> int:
+    """List active non-Apple system extensions."""
+    stdout, _, rc = _run(["systemextensionsctl", "list"], timeout=20)
+    if rc != 0 or not stdout:
+        return 0
+
+    count = 0
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("*") or "com.apple." in stripped:
+            continue
+        if "[" not in stripped and "active" not in stripped.lower():
+            continue
+        count += 1
+        counter[0] += 1
+        fid = f"integ_{counter[0]:03d}"
+        findings.append(_make_finding(
+            fid=fid,
+            severity="info",
+            category="integrity",
+            title="Non-Apple system extension present",
+            description=(
+                "A third-party system extension is installed or active. This is often legitimate "
+                "for security, VPN, or hardware software, but it runs with elevated system privileges."
+            ),
+            evidence={"systemextensionsctl_line": stripped},
+            remediation=(
+                "Review third-party system extensions in System Settings > General > Login Items & Extensions."
+            ),
+        ))
+    return count
+
+
+def _check_tcc_database(findings: list, counter: list) -> int:
+    """Inspect TCC privacy databases for suspicious high-risk grants."""
+    sensitive_services = {
+        "kTCCServiceAccessibility",
+        "kTCCServiceListenEvent",
+        "kTCCServiceScreenCapture",
+        "kTCCServiceSystemPolicyAllFiles",
+        "kTCCServiceCamera",
+        "kTCCServiceMicrophone",
+    }
+    db_paths = [
+        os.path.expanduser("~/Library/Application Support/com.apple.TCC/TCC.db"),
+        "/Library/Application Support/com.apple.TCC/TCC.db",
+    ]
+
+    findings_count = 0
+    for db_path in db_paths:
+        if not os.path.exists(db_path):
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(access)").fetchall()
+            }
+            auth_expr = "auth_value" if "auth_value" in columns else ("allowed" if "allowed" in columns else "0")
+            rows = conn.execute(
+                f"""
+                SELECT service, client, client_type, {auth_expr} AS auth_value
+                FROM access
+                """
+            ).fetchall()
+            conn.close()
+        except Exception:
+            continue
+
+        grouped: dict[str, set[str]] = {}
+        for row in rows:
+            service = str(row["service"])
+            client = str(row["client"])
+            auth_value = int(row["auth_value"] or 0)
+            if service not in sensitive_services or auth_value <= 0:
+                continue
+            if client.startswith("com.apple.") or client.startswith("/System/"):
+                continue
+            grouped.setdefault(client, set()).add(service)
+
+        for client, services in grouped.items():
+            if len(services) < 2 and not client.startswith(("/tmp/", "/private/tmp/", "/var/tmp/")):
+                continue
+            findings_count += 1
+            counter[0] += 1
+            fid = f"integ_{counter[0]:03d}"
+            findings.append(_make_finding(
+                fid=fid,
+                severity="medium" if len(services) >= 3 else "low",
+                category="privacy",
+                title="Sensitive TCC permissions granted to non-Apple client",
+                description=(
+                    f"Client '{client}' has been granted sensitive privacy permissions recorded in TCC.db. "
+                    "This may be legitimate, but broad privacy access should be reviewed."
+                ),
+                evidence={
+                    "client": client,
+                    "services": sorted(services),
+                    "database": db_path,
+                },
+                remediation=(
+                    "Review the app's permissions in System Settings > Privacy & Security and revoke anything unexpected."
+                ),
+            ))
+    return findings_count
 
 
 def _check_xprotect(findings: list, counter: list) -> dict:
@@ -444,7 +515,11 @@ def scan() -> dict:
         kext_count = _check_unsigned_kexts(findings, counter)
         metadata["third_party_kexts_loaded"] = kext_count
 
-        _check_rosetta_intel_processes(findings, counter)
+        metadata["rosetta_installed"] = _check_rosetta_intel_processes(findings, counter)
+
+        metadata["system_extensions_found"] = _check_system_extensions(findings, counter)
+
+        metadata["tcc_sensitive_clients_found"] = _check_tcc_database(findings, counter)
 
         xp = _check_xprotect(findings, counter)
         metadata.update(xp)

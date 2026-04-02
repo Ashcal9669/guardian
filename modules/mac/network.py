@@ -15,8 +15,9 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# Suspicious IP ranges: Tor exits, common C2 blocks, malicious ASNs
-# These are representative ranges — extend as needed.
+# Suspicious IP ranges: Tor exits and abuse-heavy hosting commonly used by C2.
+# Avoid broad CDN, messaging, or enterprise infrastructure ranges to reduce
+# false positives on clean systems.
 # ---------------------------------------------------------------------------
 SUSPICIOUS_IP_RANGES: list[str] = [
     # Known Tor exit relay ranges (sample)
@@ -25,19 +26,14 @@ SUSPICIOUS_IP_RANGES: list[str] = [
     "199.87.154.0/24",
     "162.247.72.0/22",
     "204.85.191.0/24",
-    # Bulletproof hosting / known malicious ASNs
+    # Abuse-heavy hosting
     "5.188.0.0/16",     # Selectel (abused)
-    "91.108.4.0/22",    # Telegram (not malicious, but notable C2 disguise)
     "77.73.134.0/24",   # Cybercrime hosting
     "193.142.146.0/24", # Known C2 range
     "45.142.212.0/24",  # Abuse-reported
-    "94.140.114.0/24",  # AdGuard DNS (flagged for policy review)
-    "31.13.64.0/19",    # Meta (C2 lookalike)
     "198.54.117.0/24",  # Abuse-reported hosting
     "185.153.196.0/22", # Cybercrime range
     "89.248.160.0/19",  # Shodan scanning / abused range
-    "216.239.32.0/19",  # Googlebot used for C2 disguise
-    "104.21.0.0/16",    # Cloudflare (used by C2 infra)
 ]
 
 _SUSPICIOUS_NETWORKS: list[ipaddress.IPv4Network] = []
@@ -118,18 +114,22 @@ def _is_suspicious_ip(ip_str: str) -> bool:
 def _parse_lsof_connections(output: str) -> list[dict]:
     """Parse lsof -i -n -P output into connection dicts."""
     conns = []
-    for line in output.splitlines()[1:]:  # skip header
+    for line in output.splitlines():
+        if not line.strip() or line.startswith("COMMAND"):
+            continue
         parts = line.split()
         if len(parts) < 9:
             continue
         name_field = parts[-1]
-        state = parts[-2] if len(parts) > 9 else ""
+        state = ""
+        if len(parts) >= 10 and parts[-2].startswith("(") and parts[-2].endswith(")"):
+            state = parts[-2].strip("()")
         # name_field looks like: 192.168.1.1:54321->1.2.3.4:443
         conns.append({
             "command": parts[0],
             "pid": parts[1],
             "user": parts[2],
-            "type": parts[7] if len(parts) > 7 else "",
+            "type": parts[4] if len(parts) > 4 else "",
             "name": name_field,
             "state": state,
         })
@@ -204,11 +204,10 @@ def _scan_listening_ports(findings: list, counter: list) -> int:
         return 0
 
     count = 0
-    for line in stdout.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) < 9:
+    for listener in _parse_lsof_connections(stdout):
+        name_field = listener["name"]
+        if not listener["state"].lower().startswith("listen") and "listen" not in name_field.lower():
             continue
-        name_field = parts[-1]
         port: int | None = None
         try:
             port = int(name_field.rsplit(":", 1)[-1])
@@ -225,18 +224,18 @@ def _scan_listening_ports(findings: list, counter: list) -> int:
                 category="network",
                 title=f"Unusual listening port: {port}",
                 description=(
-                    f"Process '{parts[0]}' (PID {parts[1]}, user {parts[2]}) is listening "
+                    f"Process '{listener['command']}' (PID {listener['pid']}, user {listener['user']}) is listening "
                     f"on TCP port {port}, which is not in the expected macOS safe list."
                 ),
                 evidence={
-                    "command": parts[0],
-                    "pid": parts[1],
-                    "user": parts[2],
+                    "command": listener["command"],
+                    "pid": listener["pid"],
+                    "user": listener["user"],
                     "address": name_field,
                     "port": port,
                 },
                 remediation=(
-                    f"Run `lsof -p {parts[1]}` to inspect open files. Disable the service "
+                    f"Run `lsof -p {listener['pid']}` to inspect open files. Disable the service "
                     "if it is not intentionally configured."
                 ),
             ))
@@ -365,18 +364,10 @@ def _scan_network_interfaces(findings: list, counter: list):
             iface_details[current] = iface_details.get(current, "") + " " + line.strip()
 
     # Flag suspicious interface types
-    suspicious_iface_prefixes = ["pktap", "ipsec", "tun", "tap", "utun", "gif", "stf"]
+    suspicious_iface_prefixes = ["pktap", "ipsec", "tun", "tap", "gif", "stf"]
     for iface in interfaces:
         for prefix in suspicious_iface_prefixes:
             if iface.startswith(prefix):
-                # utun0/1/2 are normal for VPN — flag if more than 3 utun exist
-                if iface.startswith("utun"):
-                    idx_str = iface[4:]
-                    try:
-                        if int(idx_str) < 3:
-                            break
-                    except ValueError:
-                        pass
                 counter[0] += 1
                 fid = f"net_{counter[0]:03d}"
                 findings.append(_make_finding(
@@ -398,16 +389,50 @@ def _scan_network_interfaces(findings: list, counter: list):
                 ))
                 break  # only flag once per interface
 
+    utun_ifaces = [iface for iface in interfaces if iface.startswith("utun")]
+    if len(utun_ifaces) > 6:
+        counter[0] += 1
+        fid = f"net_{counter[0]:03d}"
+        findings.append(_make_finding(
+            fid=fid,
+            severity="low",
+            category="network",
+            title=f"Large number of utun interfaces detected ({len(utun_ifaces)})",
+            description=(
+                "Multiple utun interfaces are present. This can be normal with VPN, content "
+                "filters, or enterprise networking software, but is worth confirming."
+            ),
+            evidence={"interfaces": utun_ifaces},
+            remediation=(
+                "Review active VPN, content filter, and security tools before treating this as suspicious."
+            ),
+        ))
+
 
 def _scan_packet_capture(findings: list, counter: list):
     """Check if any processes have a BPF/packet-capture socket open."""
-    stdout, stderr, rc = _run(
-        ["lsof", "-n", "-c", "tcpdump", "-c", "wireshark", "-c", "scapy", "/dev/bpf0"],
-        timeout=10,
-    )
-    # Also check any /dev/bpf* usage
-    stdout2, _, _ = _run(["lsof", "/dev/bpf0", "/dev/bpf1", "/dev/bpf2"], timeout=10)
-    combined = (stdout or "") + (stdout2 or "")
+    bpf_devices = []
+    try:
+        bpf_devices = sorted(
+            os.path.join("/dev", entry)
+            for entry in os.listdir("/dev")
+            if entry.startswith("bpf")
+        )
+    except OSError:
+        bpf_devices = []
+
+    combined_chunks: list[str] = []
+    if bpf_devices:
+        stdout, _, _ = _run(["lsof", "-n"] + bpf_devices, timeout=15)
+        if stdout:
+            combined_chunks.append(stdout)
+
+    for cmd_name in ("tcpdump", "dumpcap", "wireshark", "tshark", "ngrep", "snort", "suricata"):
+        stdout, _, _ = _run(["pgrep", "-fl", cmd_name], timeout=5)
+        if stdout:
+            combined_chunks.append(stdout)
+
+    combined = "\n".join(chunk for chunk in combined_chunks if chunk)
     if combined.strip():
         lines = [l for l in combined.splitlines() if l and not l.startswith("COMMAND")]
         if lines:
@@ -415,7 +440,7 @@ def _scan_packet_capture(findings: list, counter: list):
             fid = f"net_{counter[0]:03d}"
             findings.append(_make_finding(
                 fid=fid,
-                severity="high",
+                severity="medium",
                 category="surveillance",
                 title="Packet capture interface (BPF) is currently open",
                 description=(

@@ -43,7 +43,7 @@ _RISK_CLASS = {
 # ── Public entry point ─────────────────────────────────────────────────────────
 
 def generate_report(
-    scan_results: list,
+    scan_results: list | dict,
     output_path: str,
     device_info: Optional[dict] = None,
 ) -> str:
@@ -68,6 +68,8 @@ def generate_report(
     str
         Absolute path to the generated HTML file.
     """
+    if isinstance(scan_results, dict):
+        scan_results = list(scan_results.values())
     scan_results = scan_results or []
 
     # Collect all findings across every module
@@ -253,8 +255,12 @@ def _build_findings_json(findings: list) -> str:
     the HTML parser.
     """
     raw = json.dumps(findings, ensure_ascii=False, default=str)
-    # Escape `</` so the browser parser cannot mistake it for a closing tag
-    return raw.replace("</", "<\\/")
+    return (
+        raw
+        .replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 # ── Tiny utilities ─────────────────────────────────────────────────────────────

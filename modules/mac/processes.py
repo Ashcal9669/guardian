@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Known macOS malware / spyware process names (case-insensitive prefix match)
+# Known macOS malware / spyware process names (case-insensitive exact match)
 # ---------------------------------------------------------------------------
 KNOWN_MALWARE_NAMES: set[str] = {
     "mshelper",          # MSHelper cryptominer
@@ -200,6 +200,8 @@ def _parse_lsof_listening(output: str) -> list[dict]:
     """Parse lsof -i -n -P output, return rows where TYPE==LISTEN."""
     results = []
     for line in output.splitlines():
+        if not line.strip() or line.startswith("COMMAND"):
+            continue
         if "LISTEN" not in line and "listen" not in line.lower():
             continue
         parts = line.split()
@@ -259,33 +261,31 @@ def _scan_suspicious_locations(procs: list[dict], findings: list, counter: list)
 
 def _scan_known_malware(procs: list[dict], findings: list, counter: list):
     for proc in procs:
-        cmd_lower = proc["command"].lower()
         basename_lower = os.path.basename(proc["command"].split()[0]).lower() if proc["command"].split() else ""
-        for malware_name in KNOWN_MALWARE_NAMES:
-            if malware_name in cmd_lower or malware_name in basename_lower:
-                counter[0] += 1
-                fid = f"proc_{counter[0]:03d}"
-                findings.append(_make_finding(
-                    fid=fid,
-                    severity="critical",
-                    category="malware",
-                    title=f"Known malware process detected: {malware_name}",
-                    description=(
-                        f"Process PID {proc['pid']} matches the name of known macOS malware "
-                        f"'{malware_name}'. Immediate investigation required."
-                    ),
-                    evidence={
-                        "pid": proc["pid"],
-                        "user": proc["user"],
-                        "command": proc["command"],
-                        "matched_name": malware_name,
-                    },
-                    remediation=(
-                        f"Terminate the process: `kill -9 {proc['pid']}`. Run a full malware scan "
-                        "with Malwarebytes or ClamAV. Consider re-imaging the system."
-                    ),
-                ))
-                break
+        if basename_lower not in KNOWN_MALWARE_NAMES:
+            continue
+        counter[0] += 1
+        fid = f"proc_{counter[0]:03d}"
+        findings.append(_make_finding(
+            fid=fid,
+            severity="critical",
+            category="malware",
+            title=f"Known malware process detected: {basename_lower}",
+            description=(
+                f"Process PID {proc['pid']} matches the exact process name of known macOS malware "
+                f"'{basename_lower}'. Immediate investigation required."
+            ),
+            evidence={
+                "pid": proc["pid"],
+                "user": proc["user"],
+                "command": proc["command"],
+                "matched_name": basename_lower,
+            },
+            remediation=(
+                f"Terminate the process: `kill -9 {proc['pid']}`. Run a full malware scan "
+                "with Malwarebytes or ClamAV. Consider re-imaging the system."
+            ),
+        ))
 
 
 def _scan_random_names(procs: list[dict], findings: list, counter: list):
@@ -461,7 +461,7 @@ def scan() -> dict:
         _scan_suspicious_locations(procs, findings, counter)
         _scan_known_malware(procs, findings, counter)
         _scan_random_names(procs, findings, counter)
-        _scan_injection_indicators(findings, counter)
+        _scan_injection_indicators(procs, findings, counter)
 
         # Code signature scanning can be slow — limit to first 60 unique exes
         unique_exes_procs = []

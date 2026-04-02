@@ -12,14 +12,16 @@ import threading
 import time
 from typing import Optional
 
+REQUIRED_TOOLS = ("ideviceinfo", "ideviceinstaller")
+
 
 # ---------------------------------------------------------------------------
 # Availability check
 # ---------------------------------------------------------------------------
 
 def check_libimobiledevice_installed() -> bool:
-    """Return True if the ideviceinfo binary is present on PATH."""
-    return shutil.which("ideviceinfo") is not None
+    """Return True if the required libimobiledevice binaries are present on PATH."""
+    return all(shutil.which(tool) is not None for tool in REQUIRED_TOOLS)
 
 
 # ---------------------------------------------------------------------------
