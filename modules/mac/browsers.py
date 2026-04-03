@@ -15,6 +15,8 @@ import subprocess
 import time
 from typing import Any
 
+from ..remediation import build_remediation
+
 
 # ---------------------------------------------------------------------------
 # Known malicious extension IDs (Chromium-based)
@@ -265,10 +267,28 @@ def _scan_chromium_extensions(
                 "background_scripts": background_scripts[:5],
                 "known_malicious": is_known_malicious,
             },
-            remediation=(
-                f"Review {browser} extensions at chrome://extensions. "
-                + ("REMOVE IMMEDIATELY — known malicious." if is_known_malicious else
-                   "Remove if you do not recognise it or if permissions seem excessive.")
+            remediation=build_remediation(
+                "Browser extensions can read and modify browsing data, intercept traffic, and access saved credentials. Known-malicious extensions should be removed immediately, and unfamiliar high-permission extensions should be treated as risky until verified."
+                if is_known_malicious else
+                "This extension has elevated or privacy-sensitive permissions. Even legitimate extensions deserve review because broad browser access can expose credentials, sessions, and browsing activity.",
+                [
+                    (
+                        "Open the browser's extension management page and locate the exact extension by name or ID.",
+                        ["open 'chrome://extensions'"],
+                    ),
+                    (
+                        "Inspect the extension files and manifest to confirm what it can access.",
+                        [f"find '{ext_path}' -maxdepth 2 -name manifest.json -print -exec cat {{}} \\;"],
+                    ),
+                    (
+                        "Remove the extension if it is malicious, unfamiliar, or has unnecessary permissions.",
+                        ["open 'chrome://extensions'"],
+                    ),
+                    (
+                        "Restart the browser and confirm the extension is no longer installed.",
+                        ["open 'chrome://extensions'"],
+                    ),
+                ],
             ),
         ))
 
@@ -308,9 +328,26 @@ def _scan_chromium_preferences(
                 "profile": profile_dir,
                 "proxy_settings": proxy,
             },
-            remediation=(
-                f"Reset proxy settings in {browser} settings > System > Open proxy settings. "
-                "Or delete the Preferences file and restart the browser."
+            remediation=build_remediation(
+                "A browser-specific proxy can silently redirect traffic through an interception or monitoring service. If you did not configure it deliberately, it may indicate adware, debugging residue, or browser hijacking.",
+                [
+                    (
+                        "Inspect the relevant Preferences file and confirm the proxy mode and server values.",
+                        [f"plutil -p '{prefs_path}' | grep -A8 'proxy'"],
+                    ),
+                    (
+                        "Back up the Preferences file before making changes.",
+                        [f"cp '{prefs_path}' '{prefs_path}.bak'"],
+                    ),
+                    (
+                        "Close the browser and remove the suspicious proxy configuration by resetting the Preferences file or editing the proxy keys.",
+                        [f"rm '{prefs_path}'"],
+                    ),
+                    (
+                        "Restart the browser and confirm the proxy settings are back to normal.",
+                        [f"open -a '{browser}'"],
+                    ),
+                ],
             ),
         ))
 
@@ -332,9 +369,22 @@ def _scan_chromium_preferences(
                     "or redirect traffic. This is common on managed Macs and should be reviewed in context."
                 ),
                 evidence={"browser": browser, "policy_path": pol_path},
-                remediation=(
-                    f"Review policies at chrome://policy. "
-                    "Remove unexpected managed policy files from '{pol_path}'."
+                remediation=build_remediation(
+                    "Managed browser policies can force-install extensions, disable security features, or redirect traffic. On a personal Mac, unexpected policy files can indicate unwanted management or tampering.",
+                    [
+                        (
+                            "Review the active browser policies in the browser UI.",
+                            ["open 'chrome://policy'"],
+                        ),
+                        (
+                            "Inspect the managed policy directory on disk.",
+                            [f"find '{pol_path}' -maxdepth 2 -type f -print -exec cat {{}} \\;"],
+                        ),
+                        (
+                            "If the policies are not expected, remove the unwanted policy files and restart the browser.",
+                            [f"rm -rf '{pol_path}'"],
+                        ),
+                    ],
                 ),
             ))
             break
@@ -387,9 +437,22 @@ def _scan_firefox_extensions(
                     "active": addon.get("active", True),
                     "source_uri": addon.get("sourceURI", ""),
                 },
-                remediation=(
-                    "Review Firefox extensions at about:addons. "
-                    "Remove extensions you do not recognise."
+                remediation=build_remediation(
+                    "Firefox add-ons can read page content, intercept traffic, and access browsing history. Extensions with broad origins or permissions should be kept only if you recognize and need them.",
+                    [
+                        (
+                            "Open Firefox's add-on manager and find the flagged add-on.",
+                            ["open 'about:addons'"],
+                        ),
+                        (
+                            "Review the add-on's stored metadata on disk.",
+                            [f"cat '{addons_json_path}' | sed -n '1,200p'"],
+                        ),
+                        (
+                            "Disable or remove the add-on if it is unfamiliar or over-privileged.",
+                            ["open 'about:addons'"],
+                        ),
+                    ],
                 ),
             ))
         return count
@@ -415,7 +478,23 @@ def _scan_firefox_extensions(
                     "profile": profile_name,
                     "path": os.path.join(ext_dir, ext_entry),
                 },
-                remediation="Review Firefox extensions at about:addons.",
+                remediation=build_remediation(
+                    "This Firefox extension file was found on disk and should be matched to an add-on you intentionally installed. Unrecognized extension packages can continue affecting browser behavior until removed.",
+                    [
+                        (
+                            "Open Firefox's add-on manager and identify the matching extension entry.",
+                            ["open 'about:addons'"],
+                        ),
+                        (
+                            "Inspect the extension file on disk.",
+                            [f"ls -la '{os.path.join(ext_dir, ext_entry)}'"],
+                        ),
+                        (
+                            "Remove the extension from Firefox if you do not recognize it.",
+                            ["open 'about:addons'"],
+                        ),
+                    ],
+                ),
             ))
     except PermissionError:
         pass
@@ -461,9 +540,25 @@ def _scan_certificate_authorities(findings: list, counter: list):
             evidence={
                 "trust_overrides": suspicious_domains[:20],
             },
-            remediation=(
-                "Review custom trust settings with `security dump-trust-settings -d user` and "
-                "`security dump-trust-settings -d admin`. Remove unexpected trust overrides in Keychain Access."
+            remediation=build_remediation(
+                "Custom certificate trust overrides can be used to force the Mac to trust interception certificates, enabling TLS inspection or man-in-the-middle monitoring. Some are legitimate, but each override should be attributable to software you expect.",
+                [
+                    (
+                        "Dump the current user and admin trust settings for review.",
+                        [
+                            "security dump-trust-settings -d user",
+                            "security dump-trust-settings -d admin",
+                        ],
+                    ),
+                    (
+                        "Inspect matching certificates in the keychains.",
+                        ["security find-certificate -a -p ~/Library/Keychains/login.keychain-db | head -20"],
+                    ),
+                    (
+                        "Remove unexpected trust overrides or the associated certificate.",
+                        ["open '/Applications/Utilities/Keychain Access.app'"],
+                    ),
+                ],
             ),
         ))
 
@@ -502,9 +597,22 @@ def _scan_safari_extensions(findings: list, counter: list) -> int:
                         "bundle_id": bundle_id,
                         "enabled": is_enabled,
                     },
-                    remediation=(
-                        "Review Safari extensions in Safari > Settings > Extensions. "
-                        "Disable or remove extensions you do not recognise."
+                    remediation=build_remediation(
+                        "Safari extensions can access web content, page scripts, and browser data. Any extension you do not recognize should be removed, especially if it remains enabled.",
+                        [
+                            (
+                                "Open Safari's extension settings and locate the extension.",
+                                ["open -a Safari"],
+                            ),
+                            (
+                                "Inspect the on-disk extension metadata if needed.",
+                                [f"plutil -p '{safari_plist}'"],
+                            ),
+                            (
+                                "Disable or remove the extension if it is not expected.",
+                                ["open -a Safari"],
+                            ),
+                        ],
                     ),
                 ))
 
@@ -527,7 +635,23 @@ def _scan_safari_extensions(findings: list, counter: list) -> int:
                         "browser": "Safari",
                         "path": os.path.join(safari_ext_dir, entry),
                     },
-                    remediation="Review in Safari > Settings > Extensions.",
+                    remediation=build_remediation(
+                        "A Safari extension package was found on disk. Even if Safari is not currently using it, it should be traceable to software you intentionally installed.",
+                        [
+                            (
+                                "Inspect the extension package on disk.",
+                                [f"ls -la '{os.path.join(safari_ext_dir, entry)}'"],
+                            ),
+                            (
+                                "Open Safari and review installed extensions.",
+                                ["open -a Safari"],
+                            ),
+                            (
+                                "Remove the package if it is not recognized and no longer needed.",
+                                [f"rm -rf '{os.path.join(safari_ext_dir, entry)}'"],
+                            ),
+                        ],
+                    ),
                 ))
     except PermissionError:
         pass
@@ -576,9 +700,22 @@ def _scan_browser_proxy_settings(findings: list, counter: list):
                             "proxy_port": proxy_port,
                             "full_proxy_config": proxy_info,
                         },
-                        remediation=(
-                            "Remove proxy settings in System Settings > Network > <Interface> > Proxies. "
-                            "Investigate how this proxy was configured."
+                        remediation=build_remediation(
+                            "A system proxy affects all browser traffic and can route browsing through an external server. That is normal on some managed networks, but it should always be explicitly expected.",
+                            [
+                                (
+                                    "Inspect the current system proxy settings.",
+                                    ["scutil --proxy"],
+                                ),
+                                (
+                                    "Identify which network service is active so you can update the correct interface.",
+                                    ["networksetup -listallnetworkservices"],
+                                ),
+                                (
+                                    "Disable the unexpected proxy on the affected service.",
+                                    ["networksetup -setwebproxystate 'Wi-Fi' off", "networksetup -setsecurewebproxystate 'Wi-Fi' off"],
+                                ),
+                            ],
                         ),
                     ))
             except ValueError:
@@ -599,8 +736,22 @@ def _scan_browser_proxy_settings(findings: list, counter: list):
                             "proxy_host": proxy_host,
                             "proxy_port": proxy_port,
                         },
-                        remediation=(
-                            "Remove proxy settings in System Settings > Network > <Interface> > Proxies."
+                        remediation=build_remediation(
+                            "Interception-style proxy hostnames are often used by debugging tools, traffic filters, or monitoring products. If you did not install or configure one, browser traffic may be being redirected unexpectedly.",
+                            [
+                                (
+                                    "Review the current proxy configuration.",
+                                    ["scutil --proxy"],
+                                ),
+                                (
+                                    "Turn off the unexpected proxy for the active network service.",
+                                    ["networksetup -setwebproxystate 'Wi-Fi' off", "networksetup -setsecurewebproxystate 'Wi-Fi' off"],
+                                ),
+                                (
+                                    "Re-check the proxy settings to confirm they are gone.",
+                                    ["scutil --proxy"],
+                                ),
+                            ],
                         ),
                     ))
 

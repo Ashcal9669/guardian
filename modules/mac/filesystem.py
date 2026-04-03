@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..remediation import build_remediation
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -237,9 +239,28 @@ def _scan_suid_sgid(findings: list, counter: list) -> int:
                 "known-good baseline. This can allow privilege escalation."
             ),
             evidence={"path": path, "mode": mode},
-            remediation=(
-                f"Investigate '{path}'. If not needed, remove the SUID bit: "
-                f"`sudo chmod u-s '{path}'`. Remove the binary if malicious."
+            remediation=build_remediation(
+                "A non-baseline SUID or SGID binary can let a normal user execute code with elevated privileges. That is a classic privilege-escalation foothold if the binary is malicious or misconfigured.",
+                [
+                    (
+                        "Inspect the binary’s permissions, ownership, and signature.",
+                        [
+                            f"ls -l '{path}'",
+                            f"codesign -dv --verbose=4 '{path}'",
+                        ],
+                    ),
+                    (
+                        "Remove the SUID and SGID bits if the binary does not need them.",
+                        [
+                            f"sudo chmod u-s '{path}'",
+                            f"sudo chmod g-s '{path}'",
+                        ],
+                    ),
+                    (
+                        "If the file is malicious or orphaned, delete it after preserving any evidence you need.",
+                        f"sudo rm -f '{path}'",
+                    ),
+                ],
             ),
         ))
     return count
@@ -269,9 +290,25 @@ def _scan_world_writable_system(findings: list, counter: list) -> int:
                 "This allows any user to modify critical system files."
             ),
             evidence={"path": path},
-            remediation=(
-                f"Fix permissions: `sudo chmod o-w '{path}'`. "
-                "Investigate how permissions were changed."
+            remediation=build_remediation(
+                "World-writable files in system directories allow any local user or process to modify code or configuration that other users trust. That can lead directly to persistence or privilege escalation.",
+                [
+                    (
+                        "Inspect the file metadata before changing it.",
+                        f"ls -l '{path}'",
+                    ),
+                    (
+                        "Remove world-write permission from the file.",
+                        f"sudo chmod o-w '{path}'",
+                    ),
+                    (
+                        "Verify the corrected permissions and trace package ownership if needed.",
+                        [
+                            f"ls -l '{path}'",
+                            f"pkgutil --file-info '{path}'",
+                        ],
+                    ),
+                ],
             ),
         ))
     return count
@@ -330,9 +367,25 @@ def _scan_hidden_dotfiles(findings: list, counter: list) -> int:
                 "is_symlink": is_symlink,
                 "matched_suspicious_pattern": looks_suspicious,
             },
-            remediation=(
-                f"Investigate '{full_path}'. If unknown, remove it. "
-                "Check if it was placed there by malware."
+            remediation=build_remediation(
+                "Unexpected executable or suspicious hidden files in a home directory can be user-level persistence, droppers, or stolen-data staging artifacts. Hidden names are often used to avoid casual discovery.",
+                [
+                    (
+                        "Inspect the hidden item without executing it.",
+                        [
+                            f"ls -la '{full_path}'",
+                            f"file '{full_path}'",
+                        ],
+                    ),
+                    (
+                        "Search for references to the item in login, shell, or launchd persistence locations.",
+                        f"grep -Rni '{entry}' ~/.zsh* ~/.bash* ~/.profile ~/Library/LaunchAgents /Library/LaunchAgents /Library/LaunchDaemons 2>/dev/null",
+                    ),
+                    (
+                        "Delete the item if it is not legitimate.",
+                        f"rm -rf '{full_path}'",
+                    ),
+                ],
             ),
         ))
     return count
@@ -372,10 +425,28 @@ def _scan_recently_modified_system_bins(findings: list, counter: list) -> int:
                             "binaries may indicate compromise."
                         ),
                         evidence={"path": fpath, "mtime": mtime_str},
-                        remediation=(
-                            "Verify the binary with `codesign -v " + fpath + "`. "
-                            "Compare against a known-good system or re-install macOS "
-                            "if tampering is suspected."
+                        remediation=build_remediation(
+                            "System binaries should not change unexpectedly. A recent modification can indicate a software update, but it can also mean local tampering with trusted executables.",
+                            [
+                                (
+                                    "Inspect the binary metadata and signature.",
+                                    [
+                                        f"ls -lT '{fpath}'",
+                                        f"codesign -v '{fpath}'",
+                                    ],
+                                ),
+                                (
+                                    "Check whether the file belongs to an Apple package and compare hashes if you have a known-good reference.",
+                                    [
+                                        f"pkgutil --file-info '{fpath}'",
+                                        f"shasum -a 256 '{fpath}'",
+                                    ],
+                                ),
+                                (
+                                    "If tampering is suspected, replace the affected software via Software Update or a trusted reinstall path.",
+                                    "sudo softwareupdate --install --all",
+                                ),
+                            ],
                         ),
                     ))
         except PermissionError:
@@ -416,9 +487,25 @@ def _scan_tmp_directories(findings: list, counter: list) -> int:
                             "is_script": is_script,
                             "size_bytes": os.path.getsize(fpath),
                         },
-                        remediation=(
-                            f"Inspect '{fpath}' with `file '{fpath}'` and `strings '{fpath}'`. "
-                            "Remove if malicious. Do NOT execute."
+                        remediation=build_remediation(
+                            "Executables and scripts in temporary directories are a common malware pattern because `/tmp` and related paths are easy to write to and are often ignored by users.",
+                            [
+                                (
+                                    "Inspect the file without running it.",
+                                    [
+                                        f"file '{fpath}'",
+                                        f"strings '{fpath}' | head -50",
+                                    ],
+                                ),
+                                (
+                                    "Check whether any running process is using the file.",
+                                    f"lsof '{fpath}'",
+                                ),
+                                (
+                                    "Delete the file if it is not legitimate.",
+                                    f"rm -f '{fpath}'",
+                                ),
+                            ],
                         ),
                     ))
         except PermissionError:
@@ -461,9 +548,22 @@ def _scan_browser_extensions(findings: list, counter: list) -> int:
                                 "profile": profile,
                                 "path": os.path.join(extensions_dir, ext),
                             },
-                            remediation=(
-                                "Review extensions at about:addons in Firefox. "
-                                "Remove any you do not recognise."
+                            remediation=build_remediation(
+                                "Browser extensions can read browsing data, inject content, and access credentials depending on granted permissions. Unknown extensions should always be reviewed.",
+                                [
+                                    (
+                                        "List the Firefox extension on disk so you can match it in the browser UI.",
+                                        f"ls -l '{os.path.join(extensions_dir, ext)}'",
+                                    ),
+                                    (
+                                        "Inspect Firefox’s extension registry for the installed item.",
+                                        f"find '{extensions_dir}' -maxdepth 1 -name '{ext}' -print",
+                                    ),
+                                    (
+                                        "Remove the extension file if you confirm it is unwanted, then reopen Firefox and verify it is gone from about:addons.",
+                                        f"rm -rf '{os.path.join(extensions_dir, ext)}'",
+                                    ),
+                                ],
                             ),
                         ))
             elif browser == "Safari":
@@ -486,8 +586,22 @@ def _scan_browser_extensions(findings: list, counter: list) -> int:
                                 "extension": ext,
                                 "path": os.path.join(ext_dir, ext),
                             },
-                            remediation=(
-                                "Review Safari extensions in Safari > Settings > Extensions."
+                            remediation=build_remediation(
+                                "Safari extensions can access web content and browser state. Any extension package you do not recognize should be matched back to an expected Safari add-on or removed.",
+                                [
+                                    (
+                                        "Inspect the extension package on disk.",
+                                        f"ls -l '{os.path.join(ext_dir, ext)}'",
+                                    ),
+                                    (
+                                        "Open Safari and compare the package to what is enabled in Extensions settings.",
+                                        "open -a Safari",
+                                    ),
+                                    (
+                                        "Delete the package if you confirm it is not needed.",
+                                        f"rm -rf '{os.path.join(ext_dir, ext)}'",
+                                    ),
+                                ],
                             ),
                         ))
             else:
@@ -551,9 +665,22 @@ def _scan_browser_extensions(findings: list, counter: list) -> int:
                             "dangerous_permissions": dangerous_perms,
                             "all_permissions": permissions[:20],
                         },
-                        remediation=(
-                            f"Review {browser} extensions at chrome://extensions. "
-                            "Remove extensions with excessive permissions if not needed."
+                        remediation=build_remediation(
+                            f"{browser} extensions with broad permissions can read page content, intercept requests, or access stored session data. That may be normal for password managers or blockers, but it should be intentional.",
+                            [
+                                (
+                                    "Inspect the extension manifest and permission set on disk.",
+                                    f"find '{ext_path}' -name manifest.json -maxdepth 2 -print -exec sed -n '1,200p' {{}} \\;",
+                                ),
+                                (
+                                    f"Review the extension in {browser}’s extension manager and compare the ID.",
+                                    "open 'chrome://extensions'",
+                                ),
+                                (
+                                    "Remove the extension directory if you confirm it is unwanted.",
+                                    f"rm -rf '{ext_path}'",
+                                ),
+                            ],
                         ),
                     ))
         except PermissionError:
@@ -600,9 +727,25 @@ def _scan_keylogger_indicators(findings: list, counter: list) -> int:
                                     "matched_pattern": pattern,
                                     "is_executable": os.access(fpath, os.X_OK),
                                 },
-                                remediation=(
-                                    f"Investigate '{fpath}'. If malicious, remove it and "
-                                    "check for LaunchAgent/Daemon persistence entries."
+                                remediation=build_remediation(
+                                    "A filename associated with keylogging or covert capture deserves immediate review because surveillance tools often hide in plain sight under descriptive names.",
+                                    [
+                                        (
+                                            "Inspect the file and confirm whether it is executable.",
+                                            [
+                                                f"ls -l '{fpath}'",
+                                                f"file '{fpath}'",
+                                            ],
+                                        ),
+                                        (
+                                            "Search for persistence that launches the file.",
+                                            f"grep -Rni '{fname}' ~/Library/LaunchAgents /Library/LaunchAgents /Library/LaunchDaemons ~/.zsh* ~/.bash* ~/.profile 2>/dev/null",
+                                        ),
+                                        (
+                                            "Delete the file if it is malicious.",
+                                            f"rm -f '{fpath}'",
+                                        ),
+                                    ],
                                 ),
                             ))
                             break  # one finding per file
@@ -648,9 +791,28 @@ def _scan_crypto_miners(findings: list, counter: list) -> int:
                             "filename": fname,
                             "is_executable": os.access(fpath, os.X_OK),
                         },
-                        remediation=(
-                            f"Remove the binary: `rm '{fpath}'`. Check for LaunchAgent "
-                            "persistence. Review running processes for the miner."
+                        remediation=build_remediation(
+                            "Cryptocurrency miners consume CPU or GPU resources for someone else’s benefit. If installed without consent, they indicate abuse of the system and may come with additional persistence or malware components.",
+                            [
+                                (
+                                    "Inspect the suspected miner binary and look for running copies.",
+                                    [
+                                        f"ls -l '{fpath}'",
+                                        f"ps aux | grep -i '{fname}'",
+                                    ],
+                                ),
+                                (
+                                    "Kill any running miner processes.",
+                                    f"pkill -f '{fname}'",
+                                ),
+                                (
+                                    "Delete the binary and then check launchd persistence for relaunch entries.",
+                                    [
+                                        f"rm -f '{fpath}'",
+                                        "find ~/Library/LaunchAgents /Library/LaunchAgents /Library/LaunchDaemons -name '*.plist' -print 2>/dev/null",
+                                    ],
+                                ),
+                            ],
                         ),
                     ))
         except PermissionError:
@@ -700,10 +862,28 @@ def _scan_dylib_injection(findings: list, counter: list) -> int:
                                 "is_signed": is_signed,
                                 "is_apple_signed": is_apple,
                             },
-                            remediation=(
-                                f"Verify '{fpath}' belongs to a trusted application. "
-                                "Use `otool -L <binary>` to find what loads it. "
-                                "Remove if unknown."
+                            remediation=build_remediation(
+                                "Unexpected non-Apple dynamic libraries can be used for injection or runtime hooking. Even when they belong to legitimate software, you should confirm what loads them and whether they are expected.",
+                                [
+                                    (
+                                        "Inspect the library metadata and code signature.",
+                                        [
+                                            f"ls -l '{fpath}'",
+                                            f"codesign -dv --verbose=4 '{fpath}'",
+                                        ],
+                                    ),
+                                    (
+                                        "Search for executables or plists that reference the library.",
+                                        [
+                                            f"grep -Rni '{fname}' ~/Library /Library /Applications 2>/dev/null",
+                                            f"otool -L '{fpath}'",
+                                        ],
+                                    ),
+                                    (
+                                        "Delete the library if it is untrusted and then re-check related processes or launch items.",
+                                        f"rm -f '{fpath}'",
+                                    ),
+                                ],
                             ),
                         ))
         except PermissionError:

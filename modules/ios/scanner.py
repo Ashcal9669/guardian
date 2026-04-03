@@ -10,6 +10,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from ..remediation import build_remediation
+
 from .connector import (
     check_libimobiledevice_installed,
     get_device_info,
@@ -253,7 +255,12 @@ def _check_device_info(device_info: dict) -> list:
                     "BuildVersion": device_info.get("BuildVersion", "Unknown"),
                     "CPUArchitecture": device_info.get("CPUArchitecture", "Unknown"),
                 },
-                remediation="No action required. This is informational.",
+                remediation=build_remediation(
+                    "This finding is informational and records the connected device details used during the scan. It does not indicate a security problem by itself.",
+                    [
+                        ("Re-check the current device metadata if you want to confirm the connected device.", ["ideviceinfo"]),
+                    ],
+                ),
             )
         )
     return findings
@@ -287,10 +294,13 @@ def _check_ios_version(device_info: dict) -> list:
                     "major_version": major,
                     "status": "end_of_life",
                 },
-                remediation=(
-                    "Upgrade to the latest supported iOS version immediately. "
-                    "Go to Settings > General > Software Update. "
-                    "If your device cannot run a supported iOS version, consider replacing it."
+                remediation=build_remediation(
+                    "End-of-life iOS versions no longer receive security fixes, so publicly known kernel, WebKit, and privilege-escalation bugs remain exploitable. Continued use is a material device compromise risk.",
+                    [
+                        ("Confirm the installed iOS version from the connected device.", ["ideviceinfo | grep ProductVersion"]),
+                        ("Back up the device before upgrading or replacing it.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                        ("Install the newest supported iOS release from Settings > General > Software Update, then confirm the version again.", ["ideviceinfo | grep ProductVersion"]),
+                    ],
                 ),
             )
         )
@@ -313,9 +323,13 @@ def _check_ios_version(device_info: dict) -> list:
                     "current_major": CURRENT_IOS_MAJOR,
                     "versions_behind": CURRENT_IOS_MAJOR - major,
                 },
-                remediation=(
-                    "Update iOS as soon as possible via Settings > General > Software Update. "
-                    "Running outdated iOS increases risk of exploitation by known CVEs."
+                remediation=build_remediation(
+                    "A significantly outdated iOS release is more likely to contain known exploitable bugs and to lack platform hardening found in newer versions.",
+                    [
+                        ("Confirm the current version on the device.", ["ideviceinfo | grep ProductVersion"]),
+                        ("Create a fresh backup before updating.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                        ("Install the latest available iOS update from Settings > General > Software Update and verify the device version afterward.", ["ideviceinfo | grep ProductVersion"]),
+                    ],
                 ),
             )
         )
@@ -345,9 +359,13 @@ def _check_ios_version(device_info: dict) -> list:
                         "minimum_safe_version": min_display,
                         "major_branch": major,
                     },
-                    remediation=(
-                        f"Update to iOS {min_display} or later via "
-                        "Settings > General > Software Update."
+                    remediation=build_remediation(
+                        f"iOS {version_str} is below the minimum safe patch level for the {major}.x branch. That means known vulnerabilities fixed in later point releases may still be exploitable on this device.",
+                        [
+                            ("Confirm the installed iOS version.", ["ideviceinfo | grep ProductVersion"]),
+                            ("Back up the device before patching.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                            ("Update the device to the minimum safe release or newer from Settings > General > Software Update and verify the result.", ["ideviceinfo | grep ProductVersion"]),
+                        ],
                     ),
                 )
             )
@@ -381,10 +399,13 @@ def _check_jailbreak(device_info: dict, syslog_lines: list) -> list:
                     "to malware, spyware, and unauthorized access."
                 ),
                 evidence={"matched_strings": all_matches},
-                remediation=(
-                    "Restore the device to factory settings and reinstall a clean version of iOS. "
-                    "Go to Settings > General > Transfer or Reset iPhone > Erase All Content and Settings. "
-                    "Use iTunes/Finder to perform a full restore if the device is unresponsive."
+                remediation=build_remediation(
+                    "Jailbreak-related strings in syslog strongly suggest the device's normal security model has been bypassed. Once jailbroken, apps and tools can access protected data and install unauthorized code much more easily.",
+                    [
+                        ("Capture additional syslog evidence if needed for incident review.", ["idevicesyslog | egrep -i 'checkra1n|unc0ver|palera1n|cydia|substrate|ellekit'"]),
+                        ("Create a backup of any important data you still trust.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                        ("Perform a full erase and clean iOS restore from Finder or Apple Configurator, then avoid restoring unknown profiles or apps.", ["ideviceinfo | grep ProductVersion"]),
+                    ],
                 ),
             )
         )
@@ -411,9 +432,13 @@ def _check_jailbreak(device_info: dict, syslog_lines: list) -> list:
                         "ios_version": version_str,
                         "known_jailbreaks": ["checkra1n", "unc0ver", "Taurine", "Odyssey"],
                     },
-                    remediation=(
-                        "Update to the latest iOS version to eliminate available jailbreak vectors. "
-                        "Settings > General > Software Update."
+                    remediation=build_remediation(
+                        "This iOS version is well known in the jailbreak ecosystem. Even without a confirmed jailbreak, staying on it leaves the device exposed to tools that bypass Apple's security controls.",
+                        [
+                            ("Confirm the current iOS version.", ["ideviceinfo | grep ProductVersion"]),
+                            ("Back up the device before patching.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                            ("Update to the latest supported iOS version from Settings > General > Software Update and verify the upgrade.", ["ideviceinfo | grep ProductVersion"]),
+                        ],
                     ),
                 )
             )
@@ -459,12 +484,13 @@ def _check_installed_apps(apps: list) -> list:
                         for a in stalkerware_found
                     ]
                 },
-                remediation=(
-                    "Immediately delete the identified app(s). "
-                    "Go to Settings > General > iPhone Storage and uninstall the app. "
-                    "Also go to Settings > General > VPN & Device Management and remove any "
-                    "unknown configuration profiles. "
-                    "Consider performing a factory reset for full remediation."
+                remediation=build_remediation(
+                    "Known stalkerware and spyware apps are designed to collect calls, messages, location, and other sensitive data. Their presence should be treated as a privacy and safety incident.",
+                    [
+                        ("List installed apps again and confirm the flagged bundle IDs.", ["ideviceinstaller -l | egrep -i 'spy|stalker|mspy|flexispy|hoverwatch|qustodio|bark'"]),
+                        ("Remove the app from the device in Settings > General > iPhone Storage, then check for management profiles in Settings > General > VPN & Device Management.", ["ideviceinstaller -l"]),
+                        ("If you suspect broader compromise, back up trusted data and perform a full factory reset.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                    ],
                 ),
             )
         )
@@ -496,10 +522,13 @@ def _check_installed_apps(apps: list) -> list:
                         for a in sideloaded_found[:10]  # cap evidence at 10
                     ]
                 },
-                remediation=(
-                    "Review each listed app and uninstall any you do not recognize or trust. "
-                    "Check Settings > General > VPN & Device Management for enterprise "
-                    "provisioning profiles and remove any that are unknown."
+                remediation=build_remediation(
+                    "Potentially sideloaded apps may have bypassed normal App Store review and can carry enterprise-signed or unofficial code. If they are not expected, they increase the risk of surveillance or compromise.",
+                    [
+                        ("Review the installed app list and confirm the suspicious bundle IDs.", ["ideviceinstaller -l"]),
+                        ("Remove unknown apps from the device and check for related enterprise or developer profiles in Settings > General > VPN & Device Management.", ["ideviceinstaller -l"]),
+                        ("After cleanup, re-run the scan to confirm the apps are gone.", ["ideviceinstaller -l"]),
+                    ],
                 ),
             )
         )
@@ -539,10 +568,13 @@ def _check_installed_apps(apps: list) -> list:
                     "malicious apps to impersonate trusted software."
                 ),
                 evidence={"suspicious_apps": typosquat_found[:10]},
-                remediation=(
-                    "Review each flagged app carefully. If you did not intentionally install "
-                    "it, delete it immediately via Settings > General > iPhone Storage. "
-                    "Only install apps directly from the official App Store."
+                remediation=build_remediation(
+                    "Typosquatted apps imitate trusted software to trick users into granting access or entering credentials. They should be removed unless you can positively confirm they are legitimate.",
+                    [
+                        ("List installed apps and compare the suspicious app names and bundle IDs with the real ones.", ["ideviceinstaller -l"]),
+                        ("Delete any impersonating app from Settings > General > iPhone Storage.", ["ideviceinstaller -l"]),
+                        ("Reinstall the legitimate app only from the official App Store if you still need it.", ["ideviceinstaller -l"]),
+                    ],
                 ),
             )
         )
@@ -587,12 +619,13 @@ def _check_mdm_profiles(device_info: dict, syslog_lines: list) -> list:
                     "Unless this device is enrolled in a known corporate MDM, this is suspicious."
                 ),
                 evidence={"mdm_log_hits": mdm_indicators[:5]},
-                remediation=(
-                    "Go to Settings > General > VPN & Device Management to review all installed "
-                    "configuration profiles and MDM enrollments. "
-                    "Remove any profiles you do not recognize or that were not installed by your "
-                    "organization's IT department. "
-                    "If uncertain, perform a factory reset: Settings > General > Transfer or Reset iPhone."
+                remediation=build_remediation(
+                    "MDM profiles can remotely configure apps, networking, certificates, and restrictions. On a personal device, unexpected MDM activity may indicate unauthorized management or surveillance.",
+                    [
+                        ("Capture additional syslog related to MDM activity if needed.", ["idevicesyslog | egrep -i 'MDM|ManagedConfiguration|ConfigurationProfile|MCInstallation'"]),
+                        ("Review installed profiles and device management entries in Settings > General > VPN & Device Management, and remove anything you do not recognize.", ["ideviceinfo | egrep 'DeviceName|ProductVersion'"]),
+                        ("If you cannot verify the enrollment, back up trusted data and factory reset the device.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                    ],
                 ),
             )
         )
@@ -611,11 +644,13 @@ def _check_mdm_profiles(device_info: dict, syslog_lines: list) -> list:
                     "traffic interception, and data access."
                 ),
                 evidence={"IsSupervised": "true"},
-                remediation=(
-                    "If this device is not a corporate-managed device, supervised mode is a "
-                    "major red flag. Remove MDM profiles via Settings > General > VPN & Device "
-                    "Management, or perform a full factory restore via iTunes/Finder to remove "
-                    "the supervision lock."
+                remediation=build_remediation(
+                    "Supervised mode gives a management platform elevated control over the device, including silent app deployment and deeper restrictions. That is normal for corporate or school devices, but suspicious on a personal one.",
+                    [
+                        ("Confirm the device supervision state from the connected device record.", ["ideviceinfo | grep IsSupervised"]),
+                        ("Review profiles and MDM enrollment on the device in Settings > General > VPN & Device Management.", ["ideviceinfo | egrep 'DeviceName|ProductVersion|IsSupervised'"]),
+                        ("If the device should not be supervised, perform a full erase and restore using Finder or Apple Configurator after backing up trusted data.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                    ],
                 ),
             )
         )
@@ -637,7 +672,14 @@ def _check_syslog(syslog_lines: list) -> list:
                 title="No Syslog Data Captured",
                 description="Syslog capture returned no lines. The device may be locked or disconnected.",
                 evidence={},
-                remediation="Ensure the device is unlocked and trusted for this computer, then re-scan.",
+                remediation=build_remediation(
+                    "No syslog data usually means the device was locked, not trusted, or disconnected during collection. The scan cannot validate runtime indicators without fresh logs.",
+                    [
+                        ("Confirm the device is connected and trusted by this Mac.", ["idevice_id -l", "ideviceinfo | head"]),
+                        ("Keep the iPhone unlocked and capture live syslog again.", ["idevicesyslog | head -50"]),
+                        ("Re-run the Guardian scan once logging works.", ["ideviceinfo | grep ProductVersion"]),
+                    ],
+                ),
             )
         )
         return findings
@@ -664,10 +706,13 @@ def _check_syslog(syslog_lines: list) -> list:
                     f"can indicate surveillance software or malicious apps."
                 ),
                 evidence={"access_type": access_type, "log_samples": hit_lines[:3]},
-                remediation=(
-                    f"Review which apps have {access_type} permission in "
-                    f"Settings > Privacy & Security > {access_type.title()}. "
-                    f"Revoke access for any apps you don't recognize or trust."
+                remediation=build_remediation(
+                    f"Unexpected {access_type} access can indicate an app is using sensitive device capabilities in the background. Even legitimate apps should hold this permission only when there is a clear reason.",
+                    [
+                        ("Capture matching syslog lines for the permission use.", [f"idevicesyslog | egrep -i '{access_type}|{access_type.title()}'"]),
+                        ("Review app permissions in Settings > Privacy & Security and revoke access for any app you do not trust.", ["ideviceinstaller -l"]),
+                        ("Re-scan after permission cleanup to confirm the activity is gone.", ["ideviceinfo | grep ProductVersion"]),
+                    ],
                 ),
             )
         )
@@ -697,10 +742,13 @@ def _check_syslog(syslog_lines: list) -> list:
                     "compromise, spyware, or forensic tools running on the device."
                 ),
                 evidence={"events": exploit_hits[:5]},
-                remediation=(
-                    "Immediately backup important data and perform a factory reset. "
-                    "Settings > General > Transfer or Reset iPhone > Erase All Content and Settings. "
-                    "Use iTunes/Finder for a full DFU restore to ensure clean OS installation."
+                remediation=build_remediation(
+                    "Exploit-framework, instrumentation, or jailbreak-related syslog patterns suggest the device may be actively compromised. In that scenario, normal app removal is usually not sufficient.",
+                    [
+                        ("Capture the suspicious syslog evidence before wiping the device.", ["idevicesyslog | egrep -i 'frida|checkra1n|unc0ver|substrate|taskgated|amfid|kernel.*panic'"]),
+                        ("Back up only the data you trust.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                        ("Perform a full erase and clean restore from Finder or Apple Configurator, then update to the latest iOS release.", ["ideviceinfo | grep ProductVersion"]),
+                    ],
                 ),
             )
         )
@@ -729,10 +777,13 @@ def _check_syslog(syslog_lines: list) -> list:
                     "or ad/tracking SDKs with unusual behavior."
                 ),
                 evidence={"network_events": suspicious_network[:5]},
-                remediation=(
-                    "Review network-enabled apps in Settings > Privacy & Security > Local Network "
-                    "and consider using a VPN or DNS filter (e.g., NextDNS) to block suspicious "
-                    "domains. If exfiltration is suspected, perform a factory reset."
+                remediation=build_remediation(
+                    "Suspicious outbound connections can indicate adware, data exfiltration, or command-and-control traffic. Unknown network activity should be correlated with recently installed apps and configuration profiles.",
+                    [
+                        ("Capture additional suspicious network-related syslog lines.", ["idevicesyslog | egrep -i 'https?://|tcp|udp|connect|socket|nw_connection|ngrok|\\.xyz|\\.tk'"]),
+                        ("Review recently installed apps and Local Network permissions on the device, removing anything unexpected.", ["ideviceinstaller -l"]),
+                        ("If the behavior continues or you suspect exfiltration, back up trusted data and factory reset the device.", ["idevicebackup2 backup /tmp/guardian-ios-backup"]),
+                    ],
                 ),
             )
         )

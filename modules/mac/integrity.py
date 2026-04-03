@@ -15,6 +15,8 @@ import subprocess
 import time
 from typing import Any
 
+from ..remediation import build_remediation
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,9 +95,22 @@ def _check_sip(findings: list, counter: list) -> dict:
                 "loading unsigned kernel extensions, and other critical security controls."
             ),
             evidence={"csrutil_output": output},
-            remediation=(
-                "Re-enable SIP by booting into Recovery Mode (hold Power on Apple Silicon "
-                "or Cmd+R on Intel), open Terminal, run `csrutil enable`, and restart."
+            remediation=build_remediation(
+                "System Integrity Protection is Apple’s guardrail for core system files and runtime protections. If it is off, malware or an attacker with admin access can tamper with parts of macOS that should normally be locked down.",
+                [
+                    (
+                        "Confirm the current SIP state so you have a record before changing it.",
+                        "csrutil status",
+                    ),
+                    (
+                        "Restart into macOS Recovery and re-enable SIP from Recovery Terminal.",
+                        "csrutil enable",
+                    ),
+                    (
+                        "Restart normally and verify that SIP is enabled again.",
+                        "csrutil status",
+                    ),
+                ],
             ),
         ))
     return result
@@ -122,9 +137,22 @@ def _check_gatekeeper(findings: list, counter: list) -> dict:
                 "to run without warning. This significantly increases malware risk."
             ),
             evidence={"spctl_output": output},
-            remediation=(
-                "Re-enable Gatekeeper: `sudo spctl --master-enable`. "
-                "Or via System Settings > Privacy & Security."
+            remediation=build_remediation(
+                "Gatekeeper checks whether apps are signed and notarized before they run. When it is disabled, unsigned or tampered apps can launch with much less friction, which materially increases malware risk.",
+                [
+                    (
+                        "Check the current Gatekeeper status.",
+                        "spctl --status",
+                    ),
+                    (
+                        "Re-enable Gatekeeper so app assessments are enforced again.",
+                        "sudo spctl --master-enable",
+                    ),
+                    (
+                        "Verify that assessments are now enabled.",
+                        "spctl --status",
+                    ),
+                ],
             ),
         ))
     return result
@@ -151,9 +179,22 @@ def _check_filevault(findings: list, counter: list) -> dict:
                 "accessed if the physical disk is removed or the machine is stolen."
             ),
             evidence={"fdesetup_output": output},
-            remediation=(
-                "Enable FileVault in System Settings > Privacy & Security > FileVault. "
-                "Store the recovery key securely."
+            remediation=build_remediation(
+                "FileVault encrypts the startup disk. Without it, anyone who gets physical access to the Mac or removes the drive can read the data offline.",
+                [
+                    (
+                        "Verify the current encryption state before making changes.",
+                        "fdesetup status",
+                    ),
+                    (
+                        "Turn on FileVault from Terminal if you are ready to start encryption.",
+                        "sudo fdesetup enable",
+                    ),
+                    (
+                        "Store the recovery key securely and confirm encryption has started.",
+                        "fdesetup status",
+                    ),
+                ],
             ),
         ))
     return result
@@ -187,9 +228,22 @@ def _check_firewall(findings: list, counter: list) -> dict:
                 "This allows all incoming connections without filtering."
             ),
             evidence={"alf_state": state, "raw_output": output},
-            remediation=(
-                "Enable the firewall in System Settings > Network > Firewall, "
-                "or run: `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on`."
+            remediation=build_remediation(
+                "The macOS Application Firewall limits unsolicited inbound connections. If it is disabled, services that bind to the network are more exposed than they should be.",
+                [
+                    (
+                        "Check the current firewall state.",
+                        "defaults read /Library/Preferences/com.apple.alf globalstate",
+                    ),
+                    (
+                        "Enable the firewall.",
+                        "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on",
+                    ),
+                    (
+                        "Confirm the preference was updated.",
+                        "defaults read /Library/Preferences/com.apple.alf globalstate",
+                    ),
+                ],
             ),
         ))
     return result
@@ -220,10 +274,22 @@ def _check_secure_boot(findings: list, counter: list) -> dict | None:
                 "and reduces boot security guarantees."
             ),
             evidence={"bputil_output": output[:2000]},
-            remediation=(
-                "Restore Full Security in Recovery Mode: "
-                "Startup Security Utility > Full Security. "
-                "This will disallow third-party kernel extensions."
+            remediation=build_remediation(
+                "Reduced or permissive Secure Boot weakens the chain of trust at startup. That makes it easier for low-level software to load before macOS applies its normal protections.",
+                [
+                    (
+                        "Record the current boot policy so you know what changed.",
+                        "bputil -d",
+                    ),
+                    (
+                        "Restart into Recovery and switch the Mac back to Full Security in Startup Security Utility.",
+                        "bputil -d",
+                    ),
+                    (
+                        "After rebooting, verify the security mode again.",
+                        "bputil -d",
+                    ),
+                ],
             ),
         ))
     return result
@@ -255,9 +321,22 @@ def _check_system_version(findings: list, counter: list) -> dict:
                     "Running an unsupported OS exposes the system to unpatched vulnerabilities."
                 ),
                 evidence={"sw_vers_output": stdout.strip(), "version": version},
-                remediation=(
-                    "Upgrade to the latest supported macOS version via System Settings > "
-                    "General > Software Update."
+                remediation=build_remediation(
+                    f"macOS {version} is outside Apple’s actively supported security window. Unsupported releases stop receiving patches, so known vulnerabilities remain exposed.",
+                    [
+                        (
+                            "Record the current macOS version and build.",
+                            "sw_vers",
+                        ),
+                        (
+                            "List available software updates.",
+                            "softwareupdate -l",
+                        ),
+                        (
+                            "Install all recommended macOS updates.",
+                            "sudo softwareupdate --install --all",
+                        ),
+                    ],
                 ),
             ))
     except (ValueError, IndexError):
@@ -296,9 +375,22 @@ def _check_unsigned_kexts(findings: list, counter: list) -> int:
                 "Third-party kexts run at kernel level and represent elevated risk."
             ),
             evidence={"kextstat_line": line.strip(), "bundle_id": bundle_id},
-            remediation=(
-                f"Verify '{bundle_id}' is from a trusted vendor. "
-                "Use `kextunload -b <bundle_id>` to unload if suspicious."
+            remediation=build_remediation(
+                "Third-party kernel extensions run in kernel space, so a buggy or malicious one can cause full-system compromise. Review any loaded kext that is not Apple-provided.",
+                [
+                    (
+                        "List the currently loaded third-party kernel extensions.",
+                        "kmutil showloaded --list-only" if _is_apple_silicon() else "kextstat | grep -v com.apple",
+                    ),
+                    (
+                        f"Inspect the suspicious bundle identifier and identify the parent software package for '{bundle_id}'.",
+                        f"kmutil showloaded --list-only | grep '{bundle_id}'" if _is_apple_silicon() else f"kextstat | grep '{bundle_id}'",
+                    ),
+                    (
+                        "If the kext is not legitimate, unload it and remove the owning software.",
+                        f"sudo kextunload -b '{bundle_id}'",
+                    ),
+                ],
             ),
         ))
     return count
@@ -341,8 +433,22 @@ def _check_system_extensions(findings: list, counter: list) -> int:
                 "for security, VPN, or hardware software, but it runs with elevated system privileges."
             ),
             evidence={"systemextensionsctl_line": stripped},
-            remediation=(
-                "Review third-party system extensions in System Settings > General > Login Items & Extensions."
+            remediation=build_remediation(
+                "System extensions can legitimately belong to VPN, security, or hardware software, but they also run with elevated privileges. Anything you do not recognize should be traced back to its installed application.",
+                [
+                    (
+                        "List the active system extensions.",
+                        "systemextensionsctl list",
+                    ),
+                    (
+                        "Identify the owning app or vendor for the unexpected extension entry.",
+                        "systemextensionsctl list",
+                    ),
+                    (
+                        "Remove the parent app if the extension is not expected, then verify the extension disappears.",
+                        "systemextensionsctl list",
+                    ),
+                ],
             ),
         ))
     return count
@@ -416,8 +522,22 @@ def _check_tcc_database(findings: list, counter: list) -> int:
                     "services": sorted(services),
                     "database": db_path,
                 },
-                remediation=(
-                    "Review the app's permissions in System Settings > Privacy & Security and revoke anything unexpected."
+                remediation=build_remediation(
+                    "TCC records access to sensitive privacy domains such as camera, microphone, screen capture, and full disk access. A non-Apple client with broad TCC grants may be legitimate, but it deserves review because those permissions materially expand what the app can collect.",
+                    [
+                        (
+                            f"Inspect the TCC grants recorded for '{client}'.",
+                            f"sqlite3 '{db_path}' \"SELECT service,client,auth_value FROM access WHERE client='{client}';\"",
+                        ),
+                        (
+                            "Review the app in System Settings > Privacy & Security and remove any permission that is not required.",
+                            f"open 'x-apple.systempreferences:com.apple.preference.security?Privacy_{sorted(services)[0] if services else 'AllFiles'}'",
+                        ),
+                        (
+                            "If the app should not have these grants, remove the app and re-check the database.",
+                            f"sqlite3 '{db_path}' \"SELECT service,client,auth_value FROM access WHERE client='{client}';\"",
+                        ),
+                    ],
                 ),
             ))
     return findings_count
@@ -449,9 +569,22 @@ def _check_xprotect(findings: list, counter: list) -> dict:
                     "it has been removed or the system has been tampered with."
                 ),
                 evidence={"expected_path": plist_path},
-                remediation=(
-                    "Run Software Update to restore security components: "
-                    "`softwareupdate --all --install`."
+                remediation=build_remediation(
+                    f"{label} is a built-in Apple security component. If it is missing from its expected path, the Mac may be damaged, partially updated, or tampered with.",
+                    [
+                        (
+                            "Verify the component path and whether the plist is actually missing.",
+                            f"ls -l '{plist_path}'",
+                        ),
+                        (
+                            "Install all available Apple security updates.",
+                            "sudo softwareupdate --install --all",
+                        ),
+                        (
+                            "Re-check the component after updates complete.",
+                            f"ls -l '{plist_path}'",
+                        ),
+                    ],
                 ),
             ))
 
@@ -475,9 +608,22 @@ def _check_remote_login(findings: list, counter: list):
                 "this allows remote access and increases attack surface."
             ),
             evidence={"systemsetup_output": output},
-            remediation=(
-                "Disable if not needed: `sudo systemsetup -setremotelogin off`. "
-                "If SSH is needed, restrict access in /etc/ssh/sshd_config."
+            remediation=build_remediation(
+                "Remote Login enables the built-in SSH server. That is often intentional for administration, but if it is enabled unexpectedly it creates an exposed remote entry point.",
+                [
+                    (
+                        "Confirm the current SSH service state.",
+                        "systemsetup -getremotelogin",
+                    ),
+                    (
+                        "Disable SSH if this Mac should not accept remote logins.",
+                        "sudo systemsetup -setremotelogin off",
+                    ),
+                    (
+                        "If SSH must stay enabled, review the active sshd configuration.",
+                        "sudo sshd -T | egrep 'allowusers|passwordauthentication|permitrootlogin'",
+                    ),
+                ],
             ),
         ))
 

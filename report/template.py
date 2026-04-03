@@ -549,6 +549,13 @@ tr.detail-row td {
 
 .remediation-card .detail-card-title { color: var(--success); }
 
+.remediation-explanation {
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  line-height: 1.7;
+  margin-top: 6px;
+}
+
 .remediation-steps {
   list-style: none;
   counter-reset: step;
@@ -560,11 +567,13 @@ tr.detail-row td {
 
 .remediation-steps li {
   counter-increment: step;
-  display: flex;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  column-gap: 10px;
   font-size: 0.8125rem;
   color: var(--text-secondary);
   line-height: 1.6;
+  align-items: start;
 }
 
 .remediation-steps li::before {
@@ -580,8 +589,34 @@ tr.detail-row td {
   color: var(--success);
   font-size: 0.6875rem;
   font-weight: 700;
-  flex-shrink: 0;
   margin-top: 1px;
+}
+
+.remediation-step-body {
+  min-width: 0;
+}
+
+.remediation-step-text {
+  color: var(--text-primary);
+}
+
+.remediation-command-block {
+  margin-top: 8px;
+  background: #0d1117;
+  border: 1px solid rgba(88, 166, 255, 0.22);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  overflow-x: auto;
+  color: #a5d6ff;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.75rem;
+  line-height: 1.6;
+}
+
+.remediation-command-block code {
+  font-family: var(--font-mono);
+  color: inherit;
 }
 
 /* Finding ID + source */
@@ -870,15 +905,64 @@ tr.detail-row td {
     }
   }
 
-  function remediationSteps(text) {
-    if (!text) return '<li>No remediation steps provided.</li>';
-    // Split on numbered list markers (1. 2. etc) or newlines
-    const lines = text
-      .split(/\n|(?=\d+\.\s)/)
-      .map(l => l.replace(/^\d+\.\s*/, '').trim())
-      .filter(l => l.length > 0);
-    if (lines.length === 0) return `<li>${escHtml(text)}</li>`;
-    return lines.map(l => `<li>${escHtml(l)}</li>`).join('');
+  function renderRemediation(text) {
+    if (!text) {
+      return `
+        <div class="remediation-explanation">No remediation explanation provided.</div>
+        <ol class="remediation-steps"><li><div class="remediation-step-body"><div class="remediation-step-text">No remediation steps provided.</div></div></li></ol>
+      `;
+    }
+
+    const lines = String(text)
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    let explanation = '';
+    const steps = [];
+    let currentStep = null;
+
+    lines.forEach(line => {
+      if (line.startsWith('Explanation:')) {
+        explanation = line.replace(/^Explanation:\s*/, '').trim();
+        return;
+      }
+      const stepMatch = line.match(/^(\d+)\.\s+(.*)$/);
+      if (stepMatch) {
+        currentStep = { text: stepMatch[2].trim(), commands: [] };
+        steps.push(currentStep);
+        return;
+      }
+      if (line.startsWith('$ ') && currentStep) {
+        currentStep.commands.push(line.slice(2));
+        return;
+      }
+      if (currentStep) {
+        currentStep.text += ` ${line}`;
+      } else if (!explanation) {
+        explanation = line;
+      } else {
+        explanation += ` ${line}`;
+      }
+    });
+
+    const explanationHtml = `<div class="remediation-explanation">${escHtml(explanation || 'Review the steps below to remediate this finding.')}</div>`;
+    const stepsHtml = steps.length
+      ? steps.map(step => {
+          const commandsHtml = step.commands.length
+            ? `<pre class="remediation-command-block"><code>${escHtml(step.commands.join('\n'))}</code></pre>`
+            : '';
+          return `
+            <li>
+              <div class="remediation-step-body">
+                <div class="remediation-step-text">${escHtml(step.text)}</div>
+                ${commandsHtml}
+              </div>
+            </li>`;
+        }).join('')
+      : '<li><div class="remediation-step-body"><div class="remediation-step-text">No remediation steps provided.</div></div></li>';
+
+    return `${explanationHtml}<ol class="remediation-steps">${stepsHtml}</ol>`;
   }
 
   // ── Render ─────────────────────────────────────────────────────────────
@@ -1065,9 +1149,7 @@ tr.detail-row td {
                   </svg>
                   How to Fix
                 </div>
-                <ol class="remediation-steps">
-                  ${remediationSteps(f.remediation)}
-                </ol>
+                ${renderRemediation(f.remediation)}
               </div>
             </div>
           </div>

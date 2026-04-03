@@ -13,6 +13,8 @@ import subprocess
 import time
 from typing import Any
 
+from ..remediation import build_remediation
+
 
 # ---------------------------------------------------------------------------
 # Suspicious IP ranges: Tor exits and abuse-heavy hosting commonly used by C2.
@@ -188,9 +190,28 @@ def _scan_active_connections(findings: list, counter: list) -> tuple[list[dict],
                     "connection": conn["name"],
                     "remote_ip": remote_ip,
                 },
-                remediation=(
-                    f"Immediately terminate process {conn['pid']} with `kill -9 {conn['pid']}`. "
-                    "Investigate the binary for malware. Block the IP at the firewall level."
+                remediation=build_remediation(
+                    "An active connection to a known suspicious or Tor-associated IP can indicate command-and-control traffic, malware staging, or covert tunneling. Treat it as an incident until you prove it is benign.",
+                    [
+                        (
+                            "Inspect the process that owns the connection and record its executable path.",
+                            [
+                                f"ps -p {conn['pid']} -o pid,user,command",
+                                f"lsof -p {conn['pid']}",
+                            ],
+                        ),
+                        (
+                            "Terminate the process if it is not expected.",
+                            f"kill -9 {conn['pid']}",
+                        ),
+                        (
+                            "Block the remote IP while you investigate and confirm the connection is gone.",
+                            [
+                                f"sudo /usr/libexec/ApplicationFirewall/socketfilterfw --blockapp \"$(lsof -p {conn['pid']} 2>/dev/null | awk 'NR==2 {{print $9; exit}}')\"",
+                                f"lsof -i -n -P | grep '{remote_ip}'",
+                            ],
+                        ),
+                    ],
                 ),
             ))
             flagged.append(conn)
@@ -234,9 +255,25 @@ def _scan_listening_ports(findings: list, counter: list) -> int:
                     "address": name_field,
                     "port": port,
                 },
-                remediation=(
-                    f"Run `lsof -p {listener['pid']}` to inspect open files. Disable the service "
-                    "if it is not intentionally configured."
+                remediation=build_remediation(
+                    "A process listening on an unusual TCP port may be a legitimate local service, but it can also expose a remote control interface or unwanted daemon to the network.",
+                    [
+                        (
+                            "Inspect the listening process and identify its executable and open files.",
+                            [
+                                f"ps -p {listener['pid']} -o pid,user,command",
+                                f"lsof -p {listener['pid']}",
+                            ],
+                        ),
+                        (
+                            "Confirm why the process is bound to the port.",
+                            f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+                        ),
+                        (
+                            "Stop or disable the service if it is not intentional.",
+                            f"kill {listener['pid']}",
+                        ),
+                    ],
                 ),
             ))
     return count
@@ -282,9 +319,25 @@ def _scan_dns_config(findings: list, counter: list):
                     "address. This could indicate DNS hijacking or a malicious configuration."
                 ),
                 evidence={"resolver_ip": ip, "full_dns_config": stdout[:2000]},
-                remediation=(
-                    "Verify DNS settings in System Settings > Network > DNS. "
-                    "Reset to a known-good DNS provider (e.g. 1.1.1.1 or 8.8.8.8)."
+                remediation=build_remediation(
+                    "DNS controls where hostnames resolve. An unexpected resolver can reroute traffic, inject phishing destinations, or interfere with updates and security checks.",
+                    [
+                        (
+                            "Dump the current DNS configuration and verify which service set the resolver.",
+                            "scutil --dns",
+                        ),
+                        (
+                            "Review the active network service names before changing DNS.",
+                            "networksetup -listallnetworkservices",
+                        ),
+                        (
+                            "Set a known-good DNS server on the affected service and then flush caches.",
+                            [
+                                "sudo networksetup -setdnsservers 'Wi-Fi' 1.1.1.1 8.8.8.8",
+                                "sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder",
+                            ],
+                        ),
+                    ],
                 ),
             ))
 
@@ -339,9 +392,25 @@ def _scan_etc_hosts(findings: list, counter: list):
                 "software updates or bypass security checks."
             ),
             evidence={"suspicious_entries": suspicious_entries, "hosts_path": hosts_path},
-            remediation=(
-                "Review /etc/hosts with `cat /etc/hosts`. Remove any unauthorized entries. "
-                "Restore the default macOS /etc/hosts if needed."
+            remediation=build_remediation(
+                "The `/etc/hosts` file overrides DNS locally. Redirecting Apple or update-related domains there can be used to block updates, hijack traffic, or bypass certificate and revocation checks.",
+                [
+                    (
+                        "Inspect the current hosts file and capture a backup before editing.",
+                        [
+                            "cat /etc/hosts",
+                            "sudo cp /etc/hosts /etc/hosts.guardian-backup",
+                        ],
+                    ),
+                    (
+                        "Edit the file and remove unauthorized domain redirections.",
+                        "sudo ${EDITOR:-vi} /etc/hosts",
+                    ),
+                    (
+                        "Flush DNS caches so the cleaned file takes effect immediately.",
+                        "sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder",
+                    ),
+                ],
             ),
         ))
 
@@ -381,10 +450,25 @@ def _scan_network_interfaces(findings: list, counter: list):
                         "or a network-level surveillance tool."
                     ),
                     evidence={"interface": iface, "details": iface_details.get(iface, "")[:500]},
-                    remediation=(
-                        "Verify the interface with `ifconfig " + iface + "`. "
-                        "If you do not recognise it, check for VPN software or "
-                        "packet capture tools running as root."
+                    remediation=build_remediation(
+                        "Interfaces such as `tun`, `tap`, `pktap`, or `ipsec` often belong to VPN, interception, or packet-capture tooling. If you did not intentionally install such software, the interface warrants investigation.",
+                        [
+                            (
+                                "Inspect the interface details and confirm whether it is currently up.",
+                                f"ifconfig {iface}",
+                            ),
+                            (
+                                "Identify which process or app likely created it.",
+                                [
+                                    "ps aux | egrep 'vpn|packet|tcpdump|wireshark|charles|burp|zscaler|netskope'",
+                                    "systemextensionsctl list",
+                                ],
+                            ),
+                            (
+                                "If the interface belongs to unwanted software, stop the parent app or service and re-check the interface list.",
+                                "ifconfig -a",
+                            ),
+                        ],
                     ),
                 ))
                 break  # only flag once per interface
@@ -403,8 +487,25 @@ def _scan_network_interfaces(findings: list, counter: list):
                 "filters, or enterprise networking software, but is worth confirming."
             ),
             evidence={"interfaces": utun_ifaces},
-            remediation=(
-                "Review active VPN, content filter, and security tools before treating this as suspicious."
+            remediation=build_remediation(
+                "A large number of `utun` interfaces usually comes from repeated VPN, content-filter, or network-extension sessions. It is often benign, but a buildup can also point to misbehaving or persistent network software.",
+                [
+                    (
+                        "List the current utun interfaces so you can compare after cleanup.",
+                        "ifconfig -a | grep '^utun'",
+                    ),
+                    (
+                        "Check for active VPN, filtering, or security software that may own them.",
+                        [
+                            "systemextensionsctl list",
+                            "ps aux | egrep 'vpn|filter|zscaler|netskope|little snitch|cloudflare'",
+                        ],
+                    ),
+                    (
+                        "Restart or remove the unneeded network software and verify the interface count drops.",
+                        "ifconfig -a | grep '^utun'",
+                    ),
+                ],
             ),
         ))
 
@@ -449,9 +550,25 @@ def _scan_packet_capture(findings: list, counter: list):
                     "or a surveillance/eavesdropping application."
                 ),
                 evidence={"lsof_output": combined[:2000]},
-                remediation=(
-                    "Identify the processes using BPF with `lsof /dev/bpf*`. "
-                    "Terminate any unrecognised packet capture processes."
+                remediation=build_remediation(
+                    "Opening a BPF device means a process is sniffing packets or preparing to capture traffic. That can be legitimate for diagnostics, but it is also how eavesdropping and surveillance tools inspect local network traffic.",
+                    [
+                        (
+                            "List every process currently attached to a BPF device.",
+                            "lsof /dev/bpf*",
+                        ),
+                        (
+                            "Inspect each owner process before stopping it.",
+                            "ps aux | egrep 'tcpdump|dumpcap|wireshark|tshark|ngrep|snort|suricata'",
+                        ),
+                        (
+                            "Terminate any unrecognized capture process and confirm the BPF devices are no longer open.",
+                            [
+                                "sudo pkill -f 'tcpdump|dumpcap|wireshark|tshark|ngrep|snort|suricata'",
+                                "lsof /dev/bpf*",
+                            ],
+                        ),
+                    ],
                 ),
             ))
 

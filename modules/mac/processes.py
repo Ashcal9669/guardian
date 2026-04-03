@@ -12,6 +12,8 @@ import subprocess
 import time
 from typing import Any
 
+from ..remediation import build_remediation
+
 # ---------------------------------------------------------------------------
 # Known macOS malware / spyware process names (case-insensitive exact match)
 # ---------------------------------------------------------------------------
@@ -251,9 +253,28 @@ def _scan_suspicious_locations(procs: list[dict], findings: list, counter: list)
                         "command": cmd,
                         "suspicious_dir": sus_dir,
                     },
-                    remediation=(
-                        "Investigate the process immediately. Terminate with `kill -9 <pid>` "
-                        "if malicious. Legitimate software should not run from /tmp or ~/Downloads."
+                    remediation=build_remediation(
+                        "Processes launched from temporary or download directories are high risk because those locations are user-writable and frequently used to stage malware, adware, and one-off payloads.",
+                        [
+                            (
+                                "Inspect the process, its parent, and the executable path.",
+                                [
+                                    f"ps -p {proc['pid']} -o pid,ppid,user,command",
+                                    f"lsof -p {proc['pid']}",
+                                ],
+                            ),
+                            (
+                                "If the process is not legitimate, terminate it.",
+                                f"kill -9 {proc['pid']}",
+                            ),
+                            (
+                                "Examine the file it launched from and remove it if malicious.",
+                                [
+                                    f"file '{exe}'",
+                                    f"rm -f '{exe}'",
+                                ],
+                            ),
+                        ],
                     ),
                 ))
                 break  # only flag once per process
@@ -281,9 +302,28 @@ def _scan_known_malware(procs: list[dict], findings: list, counter: list):
                 "command": proc["command"],
                 "matched_name": basename_lower,
             },
-            remediation=(
-                f"Terminate the process: `kill -9 {proc['pid']}`. Run a full malware scan "
-                "with Malwarebytes or ClamAV. Consider re-imaging the system."
+            remediation=build_remediation(
+                "The process name directly matches a known malware family. That is strong evidence of compromise and should be handled as incident response rather than a routine cleanup task.",
+                [
+                    (
+                        "Capture process details before you kill it.",
+                        [
+                            f"ps -p {proc['pid']} -o pid,ppid,user,command",
+                            f"lsof -p {proc['pid']}",
+                        ],
+                    ),
+                    (
+                        "Terminate the malware process immediately.",
+                        f"kill -9 {proc['pid']}",
+                    ),
+                    (
+                        "Run an on-disk scan and plan for deeper remediation or rebuild if more artifacts are found.",
+                        [
+                            "which clamscan && clamscan -r /Applications ~/Library /Library",
+                            "ps aux | egrep 'launchagent|launchdaemon|cron|xmrig|mshelper|adload'",
+                        ],
+                    ),
+                ],
             ),
         ))
 
@@ -310,9 +350,31 @@ def _scan_random_names(procs: list[dict], findings: list, counter: list):
                     "command": proc["command"],
                     "basename": basename,
                 },
-                remediation=(
-                    "Investigate the process and its parent. Use `lsof -p <pid>` to see open "
-                    "files. Terminate if malicious."
+                remediation=build_remediation(
+                    "Random-looking process names are commonly used to evade simple detection and make manual review harder. This is not proof of malware on its own, but it is worth tracing carefully.",
+                    [
+                        (
+                            "Inspect the process, parent process, and open files.",
+                            [
+                                f"ps -p {proc['pid']} -o pid,ppid,user,command",
+                                f"lsof -p {proc['pid']}",
+                            ],
+                        ),
+                        (
+                            "Review the executable on disk without running it.",
+                            [
+                                f"file '{exe}'",
+                                f"strings '{exe}' | head -50",
+                            ],
+                        ),
+                        (
+                            "Terminate and remove the binary if you confirm it is malicious.",
+                            [
+                                f"kill -9 {proc['pid']}",
+                                f"rm -f '{exe}'",
+                            ],
+                        ),
+                    ],
                 ),
             ))
 
@@ -348,10 +410,31 @@ def _scan_code_signatures(procs: list[dict], findings: list, counter: list):
                     "exe": exe,
                     "codesign_error": detail,
                 },
-                remediation=(
-                    "Verify the binary is legitimate. If unknown, remove it and check "
-                    "for persistence mechanisms. Re-install affected applications from "
-                    "official sources."
+                remediation=build_remediation(
+                    "Unsigned or invalidly signed executables can indicate tampering, developer-only binaries left in production paths, or malware. Running processes from those binaries deserve review because signature failures remove a basic trust signal.",
+                    [
+                        (
+                            "Inspect the failing signature details and the executable path.",
+                            [
+                                f"codesign -dv --verbose=4 '{exe}'",
+                                f"spctl -a -vv '{exe}'",
+                            ],
+                        ),
+                        (
+                            "Determine whether the process belongs to a trusted application or package.",
+                            [
+                                f"mdls -name kMDItemCFBundleIdentifier '{exe}'",
+                                f"pkgutil --file-info '{exe}'",
+                            ],
+                        ),
+                        (
+                            "If it is not legitimate, stop the process and remove or reinstall the affected software from an official source.",
+                            [
+                                f"kill -9 {proc['pid']}",
+                                f"rm -f '{exe}'",
+                            ],
+                        ),
+                    ],
                 ),
             ))
 
@@ -386,9 +469,25 @@ def _scan_listening_ports(findings: list, counter: list) -> int:
                     "address": listener["name"],
                     "port": port,
                 },
-                remediation=(
-                    f"Investigate why '{listener['command']}' is listening on port {port}. "
-                    "Use `lsof -p <pid>` for more details. Disable if not intentional."
+                remediation=build_remediation(
+                    "A user process listening on an unexpected port may expose a local admin panel, debug service, reverse shell, or unauthorized network daemon.",
+                    [
+                        (
+                            "Inspect the process and confirm exactly what is bound to the port.",
+                            [
+                                f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+                                f"ps -p {listener['pid']} -o pid,user,command",
+                            ],
+                        ),
+                        (
+                            "Review the process’s open files and configuration.",
+                            f"lsof -p {listener['pid']}",
+                        ),
+                        (
+                            "Stop the listener if it is not intentionally configured.",
+                            f"kill {listener['pid']}",
+                        ),
+                    ],
                 ),
             ))
     return len(listeners)
@@ -425,9 +524,25 @@ def _scan_injection_indicators(procs: list[dict], findings: list, counter: list)
                     "dylib_path": dylib,
                     "full_cmdline": line[:300],
                 },
-                remediation=(
-                    "Immediately terminate the process. Investigate the dylib at the indicated "
-                    "path. Check LaunchAgent/Daemon plists for the injection vector."
+                remediation=build_remediation(
+                    "DYLD-based library injection is a strong sign that code is being forced into another process. This is a well-known malware technique and should be treated as suspicious unless you explicitly configured it for debugging.",
+                    [
+                        (
+                            "Inspect the injected library and the process using it.",
+                            [
+                                f"ps -p {pid} -o pid,user,command",
+                                f"ls -l '{dylib}'",
+                            ],
+                        ),
+                        (
+                            "Terminate the injected process.",
+                            f"kill -9 {pid}",
+                        ),
+                        (
+                            "Search for the persistence mechanism that sets DYLD_INSERT_LIBRARIES.",
+                            "grep -Rni 'DYLD_INSERT_LIBRARIES' ~/Library/LaunchAgents /Library/LaunchAgents /Library/LaunchDaemons ~/.zsh* ~/.bash* ~/.profile 2>/dev/null",
+                        ),
+                    ],
                 ),
             ))
 

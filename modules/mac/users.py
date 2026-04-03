@@ -13,6 +13,8 @@ import subprocess
 import time
 from typing import Any
 
+from ..remediation import build_remediation
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -114,10 +116,25 @@ def _scan_uid_zero_accounts(users: list[str], findings: list, counter: list):
                     "This is a common backdoor technique."
                 ),
                 evidence={"username": user, "uid": uid},
-                remediation=(
-                    f"Investigate account '{user}'. If not intentional, remove it: "
-                    f"`sudo dscl . -delete /Users/{user}`. "
-                    "Ensure no other accounts have UID 0."
+                remediation=build_remediation(
+                    "Any non-root account with UID 0 has full root privilege. Attackers create hidden UID-0 users as durable backdoors because they blend in with standard account mechanisms while retaining unrestricted access.",
+                    [
+                        (
+                            f"Inspect the account record and confirm it really has UID 0.",
+                            [
+                                f"id {user}",
+                                f"dscl . -read /Users/{user}",
+                            ],
+                        ),
+                        (
+                            "If the account is not intentional, delete it.",
+                            f"sudo dscl . -delete /Users/{user}",
+                        ),
+                        (
+                            "Verify that only the true root account still has UID 0.",
+                            "dscl . -list /Users UniqueID | awk '$2 == 0 {print}'",
+                        ),
+                    ],
                 ),
             ))
 
@@ -148,10 +165,22 @@ def _scan_empty_passwords(users: list[str], findings: list, counter: list):
                     "This allows login without credentials."
                 ),
                 evidence={"username": user, "auth_authority": auth_val[:200]},
-                remediation=(
-                    f"Set a password for '{user}': `sudo passwd {user}`. "
-                    "Disable the account if not needed: "
-                    f"`sudo dscl . -create /Users/{user} UserShell /usr/bin/false`."
+                remediation=build_remediation(
+                    "An account without a password can permit trivial local or remote access depending on other services and policies. That should be corrected immediately unless the account is intentionally disabled.",
+                    [
+                        (
+                            "Inspect the account’s authentication settings.",
+                            f"dscl . -read /Users/{user} AuthenticationAuthority",
+                        ),
+                        (
+                            "Set a password if the account should remain active.",
+                            f"sudo passwd {user}",
+                        ),
+                        (
+                            "If the account is not needed, disable interactive shell access.",
+                            f"sudo dscl . -create /Users/{user} UserShell /usr/bin/false",
+                        ),
+                    ],
                 ),
             ))
 
@@ -198,9 +227,22 @@ def _scan_sudo_access(findings: list, counter: list):
                         "line_number": lineno,
                         "line": stripped[:300],
                     },
-                    remediation=(
-                        f"Review '{fpath}'. Remove NOPASSWD unless absolutely required. "
-                        "Use `sudo visudo` to edit safely."
+                    remediation=build_remediation(
+                        "A `NOPASSWD` sudo rule allows privileged commands without interactive approval. That is convenient for automation, but it also removes a safety barrier that would normally slow down misuse.",
+                        [
+                            (
+                                "Inspect the matching sudoers line in context.",
+                                f"nl -ba '{fpath}' | sed -n '{max(1, lineno - 3)},{lineno + 3}p'",
+                            ),
+                            (
+                                "Edit the file safely with `visudo` and remove or narrow the rule.",
+                                f"sudo visudo -f '{fpath}'",
+                            ),
+                            (
+                                "Validate the sudoers syntax after the change.",
+                                f"sudo visudo -c -f '{fpath}'",
+                            ),
+                        ],
                     ),
                 ))
             # Flag broad ALL grants to non-admin groups
@@ -221,9 +263,22 @@ def _scan_sudo_access(findings: list, counter: list):
                         "line_number": lineno,
                         "line": stripped[:300],
                     },
-                    remediation=(
-                        "Review whether this sudo grant is intentional and necessary. "
-                        "Restrict to specific commands if possible."
+                    remediation=build_remediation(
+                        "Broad sudo grants can give a regular user nearly unrestricted privilege escalation. Even when intentional, they should be reviewed to ensure the scope is still justified.",
+                        [
+                            (
+                                "Inspect the sudoers rule in context.",
+                                f"nl -ba '{fpath}' | sed -n '{max(1, lineno - 3)},{lineno + 3}p'",
+                            ),
+                            (
+                                "Edit the file safely and restrict the grant to specific commands or groups if possible.",
+                                f"sudo visudo -f '{fpath}'",
+                            ),
+                            (
+                                "Validate the sudoers file after editing.",
+                                f"sudo visudo -c -f '{fpath}'",
+                            ),
+                        ],
                     ),
                 ))
 
@@ -261,9 +316,22 @@ def _scan_ssh_keys(users: list[str], findings: list, counter: list):
                 "key_count": len(lines),
                 "key_previews": [k[:80] for k in lines[:5]],
             },
-            remediation=(
-                f"Review '{auth_keys}'. Remove unknown keys. "
-                "Disable SSH if not needed: `sudo systemsetup -setremotelogin off`."
+            remediation=build_remediation(
+                "Entries in `authorized_keys` grant passwordless SSH access to the account. Unknown keys are a common persistence method because they survive password changes.",
+                [
+                    (
+                        "Inspect the current authorized keys.",
+                        f"nl -ba '{auth_keys}'",
+                    ),
+                    (
+                        "Edit the file and remove any key you do not trust.",
+                        f"sudo ${EDITOR:-vi} '{auth_keys}'",
+                    ),
+                    (
+                        "Disable SSH entirely if remote access is not required.",
+                        "sudo systemsetup -setremotelogin off",
+                    ),
+                ],
             ),
         ))
 
@@ -317,9 +385,22 @@ def _scan_login_history(findings: list, counter: list):
                 "Direct root logins bypass audit trails and are a security risk."
             ),
             evidence={"root_login_lines": root_logins[:10]},
-            remediation=(
-                "Disable root login: `sudo dsenableroot -d`. "
-                "Use sudo for administrative tasks instead."
+            remediation=build_remediation(
+                "Direct root logins reduce accountability and create a very high-value remote target. On a managed Mac, you normally want administrators to use `sudo` from named user accounts instead.",
+                [
+                    (
+                        "Confirm whether the root account is enabled.",
+                        "dsenableroot -q",
+                    ),
+                    (
+                        "Disable direct root logins if they are not explicitly required.",
+                        "sudo dsenableroot -d",
+                    ),
+                    (
+                        "Re-check recent login history after cleanup.",
+                        "last -20",
+                    ),
+                ],
             ),
         ))
 
@@ -339,9 +420,22 @@ def _scan_login_history(findings: list, counter: list):
                 "login_lines": unusual_source_logins[:10],
                 "source_ips": list(last_ips),
             },
-            remediation=(
-                "Verify these logins were authorised. If not, change all passwords, "
-                "rotate SSH keys, and disable remote login if not needed."
+            remediation=build_remediation(
+                "External login sources show that someone reached the Mac from outside the local network. If those sessions were not authorized, credentials and SSH trust material may already be compromised.",
+                [
+                    (
+                        "Review the suspicious login history entries and source IPs.",
+                        "last -100",
+                    ),
+                    (
+                        "Rotate passwords and remove or replace SSH authorized keys for affected accounts.",
+                        "find /Users -path '*/.ssh/authorized_keys' -print -exec nl -ba {} \\;",
+                    ),
+                    (
+                        "Disable SSH if it should not remain exposed.",
+                        "sudo systemsetup -setremotelogin off",
+                    ),
+                ],
             ),
         ))
 
@@ -370,9 +464,25 @@ def _scan_hidden_admin_accounts(users: list[str], findings: list, counter: list)
                         "persistent backdoor access."
                     ),
                     evidence={"username": user, "uid": uid, "dscl_output": stdout.strip()},
-                    remediation=(
-                        f"Investigate account '{user}'. Remove if not intentional: "
-                        f"`sudo dscl . -delete /Users/{user}`."
+                    remediation=build_remediation(
+                        "A hidden account with a normal user UID can provide stealthy local persistence because it is absent from the login UI but still functions as a regular account behind the scenes.",
+                        [
+                            (
+                                "Inspect the account attributes and confirm it is hidden.",
+                                [
+                                    f"dscl . -read /Users/{user}",
+                                    f"id {user}",
+                                ],
+                            ),
+                            (
+                                "Delete the account if it is not intentional.",
+                                f"sudo dscl . -delete /Users/{user}",
+                            ),
+                            (
+                                "Verify there are no remaining hidden regular-user accounts.",
+                                "for u in $(dscl . list /Users); do dscl . -read /Users/$u IsHidden 2>/dev/null; done",
+                            ),
+                        ],
                     ),
                 ))
 
@@ -407,9 +517,22 @@ def _scan_screen_sharing(findings: list, counter: list):
                 "If not intentionally configured, this is a significant surveillance risk."
             ),
             evidence={"plist": ss_plist, "enabled": enabled},
-            remediation=(
-                "Disable Screen Sharing in System Settings > General > Sharing > Screen Sharing. "
-                "Or: `sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist`."
+            remediation=build_remediation(
+                "Screen Sharing exposes a remote desktop service. If it was enabled without the owner’s intent, it can provide full visual and interactive access to the Mac.",
+                [
+                    (
+                        "Check whether the Screen Sharing launchd service is active.",
+                        "sudo launchctl list | grep screensharing",
+                    ),
+                    (
+                        "Disable the service if remote desktop access is not required.",
+                        "sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist",
+                    ),
+                    (
+                        "Verify that the service is no longer loaded.",
+                        "sudo launchctl list | grep screensharing",
+                    ),
+                ],
             ),
         ))
 
@@ -433,10 +556,22 @@ def _scan_remote_management(findings: list, counter: list):
                 "and management of this Mac. Verify this is intentional."
             ),
             evidence={"launchctl_output": stdout.strip()},
-            remediation=(
-                "Disable ARD in System Settings > General > Sharing > Remote Management. "
-                "Or: `sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/"
-                "Contents/Resources/kickstart -deactivate -stop`."
+            remediation=build_remediation(
+                "Apple Remote Desktop provides stronger remote control and management than simple SSH. If it is active unexpectedly, someone may have the ability to observe or control the Mac remotely.",
+                [
+                    (
+                        "Confirm that the ARD agent is loaded.",
+                        "sudo launchctl list | grep RemoteDesktop",
+                    ),
+                    (
+                        "Deactivate and stop Apple Remote Desktop if it is not needed.",
+                        "sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -deactivate -stop",
+                    ),
+                    (
+                        "Verify that the ARD agent is no longer active.",
+                        "sudo launchctl list | grep RemoteDesktop",
+                    ),
+                ],
             ),
         ))
 
@@ -458,10 +593,22 @@ def _scan_remote_login_status(findings: list, counter: list):
                 "If not intentionally configured, this increases the attack surface."
             ),
             evidence={"systemsetup_output": output},
-            remediation=(
-                "Disable if not needed: `sudo systemsetup -setremotelogin off`. "
-                "If SSH must remain enabled, restrict in /etc/ssh/sshd_config: "
-                "AllowUsers, PasswordAuthentication no, etc."
+            remediation=build_remediation(
+                "SSH Remote Login opens a network administration path into the Mac. That may be legitimate, but if it is enabled without a clear need it increases exposure to brute force, credential theft, and lateral movement.",
+                [
+                    (
+                        "Confirm the current SSH state.",
+                        "systemsetup -getremotelogin",
+                    ),
+                    (
+                        "Disable SSH if this Mac should not accept remote logins.",
+                        "sudo systemsetup -setremotelogin off",
+                    ),
+                    (
+                        "If SSH must stay enabled, review the effective sshd restrictions.",
+                        "sudo sshd -T | egrep 'allowusers|permitrootlogin|passwordauthentication'",
+                    ),
+                ],
             ),
         ))
 

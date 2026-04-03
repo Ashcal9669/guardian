@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..remediation import build_remediation
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -243,10 +245,32 @@ def _scan_launch_items(dirs: list[str], item_type: str, findings: list, counter:
                         "run_at_load": pdata.get("RunAtLoad", False),
                         "keep_alive": pdata.get("KeepAlive", False),
                     },
-                    remediation=(
-                        f"Inspect the plist: `cat '{full_path}'`. "
-                        f"If malicious, remove with: `launchctl unload '{full_path}' && "
-                        f"rm '{full_path}'`."
+                    remediation=build_remediation(
+                        f"This {item_type} runs automatically through launchd and was flagged because its label, executable path, signature state, or keepalive behavior looks unusual. Persistence items in user-writable paths are a common malware foothold.",
+                        [
+                            (
+                                "Inspect the plist contents to see what it launches.",
+                                f"plutil -p '{full_path}'",
+                            ),
+                            (
+                                "Review the referenced executable and verify its signature and path.",
+                                [
+                                    f"ls -l '{exe}'" if exe else f"ls -l '{full_path}'",
+                                    f"codesign -dv --verbose=4 '{exe}'" if exe else f"plutil -p '{full_path}'",
+                                ],
+                            ),
+                            (
+                                "Unload the item if you determine it is not legitimate.",
+                                f"launchctl unload '{full_path}'",
+                            ),
+                            (
+                                "Remove the plist and then inspect nearby staging locations for related files.",
+                                [
+                                    f"rm '{full_path}'",
+                                    "find /tmp /private/tmp ~/Library ~/Library/LaunchAgents /Library/LaunchDaemons -maxdepth 3 -type f | head -200",
+                                ],
+                            ),
+                        ],
                     ),
                 ))
     return total
@@ -295,9 +319,22 @@ def _scan_crontabs(findings: list, counter: list):
                     "cron_entry": stripped,
                     "command": cmd,
                 },
-                remediation=(
-                    f"Review with `crontab -l` (or `sudo crontab -u {user} -l`). "
-                    "Remove suspicious entries with `crontab -e`."
+                remediation=build_remediation(
+                    "Cron jobs execute on a schedule without user interaction. Unexpected cron entries are a classic persistence mechanism because they quietly re-run code at fixed intervals.",
+                    [
+                        (
+                            f"List the current cron table for '{user}' and confirm the suspicious command.",
+                            f"sudo crontab -u {user} -l" if user == "root" else "crontab -l",
+                        ),
+                        (
+                            "Inspect the referenced command or script before removing it.",
+                            f"printf '%s\n' \"{cmd}\"",
+                        ),
+                        (
+                            "Edit the crontab and delete the malicious or unwanted entry.",
+                            f"sudo crontab -u {user} -e" if user == "root" else "crontab -e",
+                        ),
+                    ],
                 ),
             ))
 
@@ -332,8 +369,25 @@ def _scan_periodic_scripts(findings: list, counter: list):
                         f"is owned by UID {owner_uid} instead of root."
                     ),
                     evidence={"path": full, "owner_uid": owner_uid},
-                    remediation=(
-                        f"Run `ls -la {d}` to inspect. Remove or `chown root:wheel '{full}'`."
+                    remediation=build_remediation(
+                        "Scripts inside `/etc/periodic` run automatically as part of the system’s scheduled maintenance. Anything there that is not owned by root can be abused to execute code with elevated trust.",
+                        [
+                            (
+                                "Inspect the directory and confirm the file ownership.",
+                                f"ls -la '{d}'",
+                            ),
+                            (
+                                "Review the script contents to decide whether it belongs there.",
+                                f"sed -n '1,160p' '{full}'",
+                            ),
+                            (
+                                "If the script is legitimate, restore root ownership; otherwise remove it.",
+                                [
+                                    f"sudo chown root:wheel '{full}'",
+                                    f"sudo rm -f '{full}'",
+                                ],
+                            ),
+                        ],
                     ),
                 ))
 
@@ -380,9 +434,22 @@ def _scan_shell_startup_files(findings: list, counter: list):
                             "line": line.strip()[:300],
                             "pattern": pattern.pattern,
                         },
-                        remediation=(
-                            f"Review '{fpath}' and remove the suspicious line. "
-                            "Ensure your shell environment has not been backdoored."
+                        remediation=build_remediation(
+                            "Shell startup files run whenever a shell session starts. Attackers often place one-line downloaders, reverse shells, or environment-variable injections here to relaunch malware on login or terminal open.",
+                            [
+                                (
+                                    "Inspect the suspicious line in context before editing.",
+                                    f"nl -ba '{fpath}' | sed -n '{max(1, lineno - 3)},{lineno + 3}p'",
+                                ),
+                                (
+                                    "Edit the startup file and remove the malicious command.",
+                                    f"${{EDITOR:-vi}} '{fpath}'",
+                                ),
+                                (
+                                    "Search the rest of your shell startup files for similar persistence commands.",
+                                    "grep -RniE 'curl .*sh|wget .*sh|DYLD_INSERT_LIBRARIES|base64|/tmp/.*\\.sh|bash -i >& /dev/tcp' ~/.zsh* ~/.bash* ~/.profile ~/.config/fish/config.fish 2>/dev/null",
+                                ),
+                            ],
                         ),
                     ))
                     break  # one finding per line
@@ -427,10 +494,22 @@ def _scan_ssh_authorized_keys(findings: list, counter: list):
                     "key_count": len(keys),
                     "keys_preview": [k[:80] for k in keys[:5]],
                 },
-                remediation=(
-                    f"Review '{auth_keys_path}'. Remove any keys you do not recognise. "
-                    "Disable SSH if remote login is not needed: "
-                    "`sudo systemsetup -setremotelogin off`."
+                remediation=build_remediation(
+                    "Any key in `authorized_keys` grants passwordless SSH access to that account. Unknown keys can provide silent backdoor access even after the user changes their password.",
+                    [
+                        (
+                            "Inspect the current keys and identify any unknown entries.",
+                            f"nl -ba '{auth_keys_path}'",
+                        ),
+                        (
+                            "Edit the file and delete keys you do not trust.",
+                            f"${{EDITOR:-vi}} '{auth_keys_path}'",
+                        ),
+                        (
+                            "If remote access is not needed at all, disable SSH on the Mac.",
+                            "sudo systemsetup -setremotelogin off",
+                        ),
+                    ],
                 ),
             ))
 
@@ -476,14 +555,25 @@ def _scan_kexts(findings: list, counter: list):
                         "is_apple_signed": is_apple,
                         "codesign_detail": combined[:500],
                     },
-                    remediation=(
-                        f"Verify the kext is from a trusted vendor. "
-                        + (
-                            "Use `kmutil showloaded --list-only` to list loaded extensions. "
-                            if os.uname().machine == "arm64"
-                            else "Use `kextstat | grep -v com.apple` to list loaded third-party kexts. "
-                        )
-                        + "Remove if unknown."
+                    remediation=build_remediation(
+                        "Kernel extensions run with very high privilege. A non-Apple kext may be expected for legacy hardware or security software, but an unknown one can directly affect kernel behavior and persistence.",
+                        [
+                            (
+                                "List the loaded third-party kernel extensions.",
+                                "kmutil showloaded --list-only" if os.uname().machine == "arm64" else "kextstat | grep -v com.apple",
+                            ),
+                            (
+                                "Inspect the extension bundle and its signature details.",
+                                [
+                                    f"ls -l '{full}'",
+                                    f"codesign -dv --verbose=4 '{full}'",
+                                ],
+                            ),
+                            (
+                                "If the kext is not legitimate, unload and remove the owning software package.",
+                                f"sudo kmutil unload -p '{full}'" if os.uname().machine == "arm64" else f"sudo kextunload '{full}'",
+                            ),
+                        ],
                     ),
                 ))
 
@@ -514,10 +604,25 @@ def _scan_login_hooks(findings: list, counter: list):
                     "hook_path": hook_val,
                     "plist": plist_path,
                 },
-                remediation=(
-                    f"Remove the hook: `sudo defaults delete /Library/Preferences/"
-                    f"com.apple.loginwindow {hook_key}`. "
-                    "Investigate the script at the hook path."
+                remediation=build_remediation(
+                    "Login and logout hooks execute scripts as part of the loginwindow flow. They are deprecated, uncommon on normal Macs, and frequently abused for persistence because they run automatically.",
+                    [
+                        (
+                            "Inspect the configured hook and review the referenced script.",
+                            [
+                                f"defaults read /Library/Preferences/com.apple.loginwindow {hook_key}",
+                                f"ls -l '{hook_val}'",
+                            ],
+                        ),
+                        (
+                            "Remove the hook from the loginwindow preferences.",
+                            f"sudo defaults delete /Library/Preferences/com.apple.loginwindow {hook_key}",
+                        ),
+                        (
+                            "If the script is malicious, delete it after preserving any evidence you need.",
+                            f"sudo rm -f '{hook_val}'",
+                        ),
+                    ],
                 ),
             ))
 
@@ -546,8 +651,25 @@ def _scan_startup_items(findings: list, counter: list):
                 "executed and are commonly used by malware for persistence."
             ),
             evidence={"path": full},
-            remediation=(
-                f"Inspect '{full}' for malicious content. Remove with: `sudo rm -rf '{full}'`."
+            remediation=build_remediation(
+                "Legacy StartupItems are deprecated but still get attention because malware can abuse them for persistence on older or modified systems. A StartupItem should almost always be reviewed closely.",
+                [
+                    (
+                        "Inspect the StartupItem contents and any scripts it runs.",
+                        [
+                            f"find '{full}' -maxdepth 2 -print",
+                            f"sed -n '1,160p' '{full}'/* 2>/dev/null",
+                        ],
+                    ),
+                    (
+                        "If the item is not legitimate, remove it.",
+                        f"sudo rm -rf '{full}'",
+                    ),
+                    (
+                        "Search for related launchd persistence after cleanup.",
+                        "find ~/Library/LaunchAgents /Library/LaunchAgents /Library/LaunchDaemons -name '*.plist' -print 2>/dev/null",
+                    ),
+                ],
             ),
         ))
 
@@ -582,9 +704,22 @@ def _scan_login_items(findings: list, counter: list):
                 "Review to ensure it is expected."
             ),
             evidence={"item_name": item},
-            remediation=(
-                "Review Login Items in System Settings > General > Login Items. "
-                "Remove any items you do not recognise."
+            remediation=build_remediation(
+                "Login Items start automatically when the user signs in. Many are benign, but anything unexpected should be traced back to the installed application because it provides persistent execution at login.",
+                [
+                    (
+                        "List the current login items again so you can compare before and after cleanup.",
+                        "osascript -e 'tell application \"System Events\" to get the name of every login item'",
+                    ),
+                    (
+                        f"Remove the unexpected login item named '{item}'.",
+                        f"osascript -e 'tell application \"System Events\" to delete login item \"{item}\"'",
+                    ),
+                    (
+                        "Re-list login items to confirm it is gone.",
+                        "osascript -e 'tell application \"System Events\" to get the name of every login item'",
+                    ),
+                ],
             ),
         ))
 
