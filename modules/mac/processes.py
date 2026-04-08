@@ -82,6 +82,148 @@ SAFE_LISTENING_PORTS: set[int] = {
 _B64_RE = re.compile(r'^[A-Za-z0-9+/]{12,}={0,2}$')
 _RANDOM_RE = re.compile(r'^[a-f0-9]{8,}$')
 
+# Known Apple/system process basenames that look random but are legitimate
+_KNOWN_SYSTEM_PROCS: frozenset[str] = frozenset({
+    "WindowServer",
+    "launchservicesd",
+    "mediaremoted",
+    "notifyd",
+    "cfprefsd",
+    "distnoted",
+    "lsd",
+    "corebrightnessd",
+    "coreauthd",
+    "ctkd",
+    "secd",
+    "syspolicyd",
+    "tccd",
+    "trustd",
+    "nsurlsessiond",
+    "nsurlstoraged",
+    "rapportd",
+    "screensharingd",
+    "sharingd",
+    "pamd",
+    "spindump",
+    "SubmitDiagInfo",
+    "CrashReporterSupportHelper",
+    "sysmond",
+    "logd",
+    "osanalyticshelper",
+    "ckdiscretionaryd",
+    "companionlinkclient",
+    "swcd",
+    "rtcreportingd",
+    "mobileassetd",
+    "mdworker",
+    "mdworker_shared",
+    "mds",
+    "mds_stores",
+    "timed",
+    "locationd",
+    "kernelmanagerd",
+    "fairplayd",
+    "storagekitd",
+    "diskarbitrationd",
+    "diskmanagementd",
+    "fmfd",
+    "fmflocatord",
+    "biometrickitd",
+    "passd",
+    "calaccessd",
+    "callservicesd",
+    "CommCenter",
+    "imagent",
+    "IMDPersistenceAgent",
+    "imtranscoded",
+    "navd",
+    "akd",
+    "parsecd",
+    "photolibraryd",
+    "photoanalysisd",
+    "siriknowledged",
+    "spotlightknowledged",
+    "knowledge-agent",
+    "intelligenceplatformd",
+    "coreduetd",
+    "duetexpertd",
+    "adprivacyd",
+    "remindd",
+    "CalendarAgent",
+    "AddressBookSourceSync",
+    "ContactsAgent",
+    "routined",
+    "UsageTrackingAgent",
+    "AppSSOAgent",
+    "AppSSODaemon",
+    "siriinferenced",
+    "suggestions",
+    "webbookmarksd",
+    "cloudd",
+    "cloudphotod",
+    "cloudpaird",
+    "com.apple.iCloud",
+    "bird",
+    "brcd",
+    "itunescloudd",
+    "storeassetd",
+    "storedownloadd",
+    "storekitagent",
+    "storeuid",
+    "AMPLibraryAgent",
+    "AMPArtworkAgent",
+    "AMPDeviceDiscoveryAgent",
+    "medialibraryd",
+    "mediaanalysisd",
+    "mediaremoteagent",
+    "tccd",
+    "transparencyd",
+    "privacyaccountingd",
+    "symptomsd",
+    "networkserviceproxy",
+    "nesessionmanager",
+    "nehelper",
+    "netbiosd",
+    "discoveryd",
+    "mDNSResponder",
+    "racoon",
+    "isakmpd",
+    "socketfilterfw",
+    "appfirewall",
+    "captiveagent",
+    "airportd",
+    "wifid",
+    "wirelessproxd",
+    "bluetoothd",
+    "BTLEServerAgent",
+    "thermald",
+    "powerd",
+    "powerlogHelperd",
+    "syslogd",
+    "auditd",
+    "amfid",
+    "endpointsecurityd",
+    "XProtectBehaviorService",
+    "XprotectService",
+    "MRT",
+    "taskgated",
+    "nfsd",
+    "automountd",
+    "autofsd",
+    "kextd",
+    "kernelmanagerd",
+    "watchdogd",
+    "launchd",
+    "loginwindow",
+    "UserEventAgent",
+    "SystemUIServer",
+    "Dock",
+    "Finder",
+    "SpringBoard",
+    "hidd",
+    "HIDAnalyticsAgent",
+})
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -187,14 +329,26 @@ def _get_exe_from_command(command: str) -> str:
 def _looks_random(name: str) -> bool:
     """Heuristic: does this process name look like a random/generated string?"""
     base = os.path.basename(name)
-    if _B64_RE.match(base):
-        return True
+    # Skip anything clearly rooted in Apple or OS system paths
+    if name.startswith(("/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/",
+                        "/sbin/", "/bin/", "/Library/Apple/", "/Library/PrivilegedHelperTools/")):
+        return False
+    # basename-only allowlist only fires when no path is given (prevents /tmp/WindowServer bypass)
+    if "/" not in name and base in _KNOWN_SYSTEM_PROCS:
+        return False
+    # Pure hex string (e.g. malware dropper named after its own hash)
     if _RANDOM_RE.match(base):
         return True
-    # Long name with no vowels = suspicious
-    alpha = re.sub(r'[^a-z]', '', base.lower())
-    if len(alpha) >= 10 and not re.search(r'[aeiou]', alpha):
+    # Base64-looking name — only flag when it has NO path (bare name = unresolvable = suspicious)
+    # A resolved path like /Applications/SomeApp.app/Contents/MacOS/aGVsbG8K is still flagged
+    if _B64_RE.match(base):
         return True
+    # Long name with no vowels — only flag when process has a concrete path (reduces noise on
+    # kernel thread names and short daemon abbreviations without full paths)
+    if "/" in name:
+        alpha = re.sub(r'[^a-z]', '', base.lower())
+        if len(alpha) >= 10 and not re.search(r'[aeiou]', alpha):
+            return True
     return False
 
 
@@ -332,7 +486,7 @@ def _scan_random_names(procs: list[dict], findings: list, counter: list):
     for proc in procs:
         exe = _get_exe_from_command(proc["command"])
         basename = os.path.basename(exe)
-        if _looks_random(basename):
+        if _looks_random(exe):
             counter[0] += 1
             fid = f"proc_{counter[0]:03d}"
             findings.append(_make_finding(

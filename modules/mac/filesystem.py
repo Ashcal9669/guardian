@@ -80,13 +80,20 @@ KEYLOGGER_PATTERNS: list[str] = [
     "keystroke",
     "keypress",
     "key_capture",
-    "keycap",
-    "klog",
-    "type_capture",
-    "screen_capture",
+    # "keycap" removed — too broad, matches keyboard asset/doc filenames
+    # "type_capture" removed — matches dev/media tooling artifacts
+    # "screen_capture" removed — matches many legitimate tools; use "screenshot_tool" only
     "screengrab",
     "screenshot_tool",
 ]
+
+# Apple system files whose names contain pattern substrings but are benign
+KEYLOGGER_PATTERN_ALLOWLIST: frozenset[str] = frozenset({
+    "feedbacklog",           # Apple Intelligence feedback DB
+    "com.apple.feedbacklogd",
+    "screenshotui",          # macOS Screenshot.app helper
+    "com.apple.screencapture",
+})
 
 KNOWN_BENIGN_DOTFILE_PREFIXES: tuple[str, ...] = (
     ".git",
@@ -707,15 +714,19 @@ def _scan_keylogger_indicators(findings: list, counter: list) -> int:
                 dirnames[:] = [d for d in dirnames if not d.startswith(".") or dirpath == search_dir]
                 for fname in filenames:
                     fname_lower = fname.lower()
+                    if fname_lower in KEYLOGGER_PATTERN_ALLOWLIST:
+                        continue
                     for pattern in KEYLOGGER_PATTERNS:
                         if pattern in fname_lower:
                             fpath = os.path.join(dirpath, fname)
+                            is_executable = os.access(fpath, os.X_OK)
+                            severity = "critical" if is_executable else "high"
                             count += 1
                             counter[0] += 1
                             fid = f"fs_{counter[0]:03d}"
                             findings.append(_make_finding(
                                 fid=fid,
-                                severity="critical",
+                                severity=severity,
                                 category="surveillance",
                                 title=f"Potential keylogger file: {fname}",
                                 description=(
@@ -725,7 +736,7 @@ def _scan_keylogger_indicators(findings: list, counter: list) -> int:
                                 evidence={
                                     "path": fpath,
                                     "matched_pattern": pattern,
-                                    "is_executable": os.access(fpath, os.X_OK),
+                                    "is_executable": is_executable,
                                 },
                                 remediation=build_remediation(
                                     "A filename associated with keylogging or covert capture deserves immediate review because surveillance tools often hide in plain sight under descriptive names.",
